@@ -1,0 +1,57 @@
+[profile.default]
+# Source directories
+src = "contracts"
+out = "out"
+libs = ["node_modules", "lib"]
+test = "test/foundry"
+
+# Solidity compiler settings (match hardhat.config.js)
+solc_version = "0.8.22"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 100
+via_ir = true
+
+# Allow FFI for calling external scripts (e.g., KyberSwap API helper)
+ffi = true
+
+# Remappings for OpenZeppelin and other dependencies
+remappings = [
+    "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+    "@redstone-finance/=node_modules/@redstone-finance/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Fork configuration
+# These can be used in tests: vm.createSelectFork("hyperliquid")
+# Or CLI: forge test --fork-url hyperliquid
+# To override: set HYPEREVM_RPC_URL env var before running
+[rpc_endpoints]
+hyperliquid = "https://rpc.hyperliquid.xyz/evm"
+hyperliquid_testnet = "https://rpc.hyperliquid-testnet.xyz/evm"
+
+# Fuzz testing settings
+[fuzz]
+runs = 256
+max_test_rejects = 65536
+seed = "0x1234"
+
+# Invariant testing settings
+[invariant]
+runs = 256
+depth = 15
+fail_on_revert = false
+
+# Gas reporting - list contracts to report gas for
+# gas_reports = ["KinetiqIntegration", "HypeNovaExchange"]
+
+# CI profile - more thorough testing
+[profile.ci]
+fuzz = { runs = 1000 }
+invariant = { runs = 500, depth = 20 }
+
+# Quick profile - for fast iteration
+[profile.quick]
+fuzz = { runs = 32 }
+invariant = { runs = 32, depth = 5 }
