@@ -1,7 +1,7 @@
 {
-  "name": "hypezion-protocol",
+  "name": "hypezion-finance",
   "version": "0.1.1",
-  "description": "HypeZion Protocol - Decentralized stablecoin and leverage token system on HyperEVM",
+  "description": "HypeZion finance - Decentralized stablecoin and leverage token system on HyperEVM",
   "main": "index.js",
   "scripts": {
     "test": "hardhat test",
