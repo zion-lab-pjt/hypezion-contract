@@ -98,6 +98,18 @@ interface IDexIntegration {
     function setExchange(address _exchange) external;
 
     /**
+     * @notice Swap HYPE to kHYPE directly via DEX
+     * @dev Replaces the old Kinetiq staking flow with direct DEX swap
+     * @param swapData Encoded swap data from DEX API (HYPE → kHYPE)
+     * @param minKHypeOut Minimum kHYPE to receive (slippage protection)
+     * @return kHypeReceived Amount of kHYPE received after fee
+     */
+    function swapToKHype(
+        bytes calldata swapData,
+        uint256 minKHypeOut
+    ) external payable returns (uint256 kHypeReceived);
+
+    /**
      * @notice Emergency function to rescue stuck tokens
      * @param token Token address
      * @param amount Amount to rescue

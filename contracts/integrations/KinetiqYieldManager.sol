@@ -5,42 +5,51 @@ import "@openzeppelin/contracts-upgradeable/access/AccessControlUpgradeable.sol"
 import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol";
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IKinetiqIntegration.sol";
 import "../interfaces/IStabilityPool.sol";
+import "../interfaces/IDexIntegration.sol";
 import "../core/HypeZionExchange.sol";
 
 /**
  * @title KinetiqYieldManager
- * @notice Manages yield harvesting and compounding from Kinetiq staking following Hylo's economic model
+ * @notice Manages yield harvesting and compounding from kHYPE staking following Hylo's economic model
  * @dev Harvests kHYPE yield and compounds to StabilityPool as hzUSD
  *      - Staked hzUSD holders receive 100% of yield
  *      - xHYPE holders receive 0% yield (pure leverage exposure)
- *      - Harvest functions are permissionless (anyone can call)
+ *      - Harvest/compound functions are restricted to OPERATOR_ROLE
  *      - All validation logic is in the contract
  *      - UUPS upgradeable pattern
+ *
+ * V2 Changes (DEX-based flow):
+ *      - Removed 2-step queue/claim flow (old Kinetiq unstaking)
+ *      - New single-step harvestAndCompound() using DEX swaps
+ *      - No waiting period (instant DEX swaps)
+ *      - Lower minimum harvest amount (0.01 HYPE vs 5 HYPE)
  */
 contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
-    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
-    uint256 public constant COMPOUND_COOLDOWN = 5 minutes; // Minimum time between compound operations
+    using SafeERC20 for IERC20;
 
-    // Kinetiq integration contract
+    bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
+
+    // Kinetiq integration contract (for exchange rate queries)
     IKinetiqIntegration public kinetiqIntegration;
 
     // Protocol integration
     address payable public hypeZionExchange;
     address public stabilityPool;
 
-    // Withdrawal tracking
+    // @deprecated - kept for storage layout compatibility
     struct WithdrawalRequest {
-        uint256 withdrawalId;      // Kinetiq withdrawal ID
-        uint256 kHypeAmount;        // kHYPE amount withdrawn
-        uint256 hypeAmount;         // HYPE amount (locked at queue time)
-        uint256 queuedAt;          // Timestamp when queued
-        bool claimed;              // Whether HYPE was claimed
+        uint256 withdrawalId;
+        uint256 kHypeAmount;
+        uint256 hypeAmount;
+        uint256 queuedAt;
+        bool claimed;
     }
-    WithdrawalRequest[] public pendingWithdrawals;
-    mapping(uint256 => uint256) public withdrawalIdToIndex;  // Kinetiq ID -> array index
-    
+    WithdrawalRequest[] internal pendingWithdrawals; // @deprecated
+    mapping(uint256 => uint256) internal withdrawalIdToIndex; // @deprecated
+
     // NAV tracking
     struct NAVSnapshot {
         uint256 khypeBalance;
@@ -49,50 +58,57 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
         uint256 timestamp;
         uint256 yieldAccrued;
     }
-    
+
     // Historical NAV snapshots
     NAVSnapshot[] public navHistory;
     mapping(uint256 => NAVSnapshot) public navSnapshots; // timestamp => snapshot
-    
+
     // Yield distribution
     uint256 public totalYieldHarvested;
     uint256 public lastHarvestTimestamp;
-    uint256 public lastCompoundTimestamp; // Last time compound was executed
-    uint256 public harvestInterval;
+    uint256 public lastCompoundTimestamp;
+    uint256 public harvestInterval; // @deprecated - kept for storage layout compatibility
 
     // NAV thresholds and alerts
     uint256 public constant MIN_NAV_RATIO = 1e18; // 1.0 (kHYPE should never be worth less than HYPE)
     uint256 public navAlertThreshold;
 
-    // Storage gap for future upgrades (UUPS pattern)
-    uint256[50] private __gap; // Reduced from 50 to 49 (1 new slot used: lastCompoundTimestamp)
+    IDexIntegration public dexIntegration;
+    uint256 public minHarvestAmount;
+
+    // Native token address used by KyberSwap
+    address public constant NATIVE_TOKEN = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+
+    // Pending harvested HYPE waiting for compound step
+    uint256 public pendingHarvestedHype;
+
+    // Storage gap for future upgrades
+    uint256[46] private __gap;
 
     // Events
     event NAVUpdated(uint256 indexed timestamp, uint256 khypeBalance, uint256 hypeValue, uint256 exchangeRate);
     event YieldHarvested(uint256 indexed timestamp, uint256 yieldAmount, address indexed harvester);
     event NAVAlert(uint256 indexed timestamp, uint256 currentRate, uint256 expectedRate);
-    event HarvestIntervalUpdated(uint256 oldInterval, uint256 newInterval);
     event NAVAlertThresholdUpdated(uint256 oldThreshold, uint256 newThreshold);
-    event YieldWithdrawalQueued(uint256 indexed withdrawalId, uint256 hypeAmount, uint256 timestamp);
-    event YieldCompounded(uint256 indexed withdrawalId, uint256 hypeAmount, uint256 hzusdMinted, uint256 timestamp);
     event HypeZionExchangeSet(address indexed exchange);
     event StabilityPoolSet(address indexed pool);
+    event YieldCompounded(uint256 kHypeHarvested, uint256 hypeReceived, uint256 hzusdMinted, uint256 timestamp);
+    event DexIntegrationSet(address indexed dexIntegration);
+    event MinHarvestAmountSet(uint256 amount);
+    event YieldHarvestedToStorage(uint256 kHypeHarvested, uint256 hypeReceived, uint256 timestamp);
 
     // Errors
     error InvalidNAV();
-    error HarvestTooSoon();
     error NoYieldToHarvest();
     error NAVBelowMinimum();
-    error InvalidInterval();
     error InvalidThreshold();
     error InvalidAddress();
     error OnlyExchange();
     error YieldTooSmall();
     error InsufficientRemaining();
-    error WithdrawalNotReady();
-    error AlreadyClaimed();
-    error AmountMismatch();
-    error CompoundTooSoon();
+    error SwapFailed();
+    error MintFailed();
+    error NoPendingHype();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -114,73 +130,49 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
         kinetiqIntegration = IKinetiqIntegration(_kinetiqIntegration);
 
         // Set default values
-        harvestInterval = 1 days; // Default 24 hours
         navAlertThreshold = 95e16; // 0.95 - alert if NAV drops below 95% of expected
+        minHarvestAmount = 0.01 ether;
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATOR_ROLE, msg.sender);
     }
 
     /**
-     * @notice Receive HYPE from Kinetiq withdrawals
-     * @dev Only accept HYPE from trusted sources: Kinetiq integration, exchange, or authorized roles
+     * @notice Receive HYPE from DEX swaps and other sources
+     * @dev Accept HYPE from any source. This contract doesn't hold user funds,
+     *      so there's no security risk from receiving HYPE from unknown sources.
      */
-    receive() external payable {
-        require(
-            msg.sender == address(kinetiqIntegration) ||
-            msg.sender == hypeZionExchange ||
-            hasRole(OPERATOR_ROLE, msg.sender) ||
-            hasRole(DEFAULT_ADMIN_ROLE, msg.sender),
-            "Unauthorized HYPE sender"
-        );
-    }
+    receive() external payable {}
 
     /**
-     * @notice Helper: Calculate total HYPE value of staked assets
-     * @dev After vault integration, all kHYPE is held in the vault, not in KinetiqIntegration
-     * @return Total HYPE value (vault kHYPE balance × exchange rate)
+     * @notice Helper: Calculate total HYPE value of collateral kHYPE (excludes protocol fees)
+     * @dev Uses totalKHYPEBalance (accounting balance) instead of physical vault balance
+     *      to exclude accumulatedFees kHYPE from yield calculations.
+     * @return Total HYPE value (collateral kHYPE × exchange rate)
      */
     function _getTotalHYPEValue() internal view returns (uint256) {
-        // Get kHYPE from Vault (all kHYPE is now in vault after integration)
-        uint256 vaultKHYPE = 0;
-        try HypeZionExchange(hypeZionExchange).getVaultKHYPEBalance() returns (uint256 balance) {
-            vaultKHYPE = balance;
-        } catch {
-            // If exchange doesn't have vault or getVaultKHYPEBalance function, vault balance is 0
-            vaultKHYPE = 0;
-        }
-
-        // Convert kHYPE to HYPE value
+        uint256 collateralKHYPE = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
         uint256 exchangeRate = kinetiqIntegration.getExchangeRate();
-        return (vaultKHYPE * exchangeRate) / 1e18;
+        return (collateralKHYPE * exchangeRate) / 1e18;
     }
 
     /**
-     * @notice Update NAV snapshot from Kinetiq and Vault
+     * @notice Update NAV snapshot from vault
      * @dev Fetches current exchange rate and balances from vault
      */
     function updateNAV() external onlyRole(OPERATOR_ROLE) {
-        // Get kHYPE balance from vault and exchange rate
-        uint256 khypeBalance = 0;
-        try HypeZionExchange(hypeZionExchange).getVaultKHYPEBalance() returns (uint256 balance) {
-            khypeBalance = balance;
-        } catch {
-            khypeBalance = 0;
-        }
+        // Use accounting balance (excludes fee kHYPE) for accurate NAV tracking
+        uint256 khypeBalance = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
         uint256 exchangeRate = kinetiqIntegration.getExchangeRate();
 
-        // Validate NAV is reasonable
         if (exchangeRate < MIN_NAV_RATIO) revert NAVBelowMinimum();
 
-        // Calculate HYPE value
         uint256 hypeValue = (khypeBalance * exchangeRate) / 1e18;
-        
-        // Check for NAV anomaly
+
         if (exchangeRate < MIN_NAV_RATIO * navAlertThreshold / 1e18) {
             emit NAVAlert(block.timestamp, exchangeRate, MIN_NAV_RATIO);
         }
-        
-        // Calculate yield accrued since last snapshot
+
         uint256 yieldAccrued = 0;
         if (navHistory.length > 0) {
             NAVSnapshot memory lastSnapshot = navHistory[navHistory.length - 1];
@@ -188,8 +180,7 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
                 yieldAccrued = hypeValue - lastSnapshot.hypeValue;
             }
         }
-        
-        // Create new snapshot
+
         NAVSnapshot memory snapshot = NAVSnapshot({
             khypeBalance: khypeBalance,
             hypeValue: hypeValue,
@@ -197,16 +188,15 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
             timestamp: block.timestamp,
             yieldAccrued: yieldAccrued
         });
-        
-        // Store snapshot
+
         navHistory.push(snapshot);
         navSnapshots[block.timestamp] = snapshot;
-        
+
         emit NAVUpdated(block.timestamp, khypeBalance, hypeValue, exchangeRate);
     }
-    
+
     /**
-     * @notice Calculate current yield available for harvesting
+     * @notice Calculate current yield available for harvesting in HYPE terms
      * @dev Yield = Current HYPE value - Original deposits (from Exchange)
      * @return yieldInHYPE Amount of HYPE yield available
      */
@@ -222,91 +212,100 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
     }
 
     /**
-     * @notice Queue withdrawal of accumulated yield
-     * @dev Permissionless - can be called by anyone. All validations are in the contract.
-     *      Follows Hylo's economic model where yield goes to staked hzUSD holders.
-     *      Enforces 5-minute cooldown between compound operations.
-     * @return withdrawalId Kinetiq withdrawal ID
+     * @notice Calculate current yield available for harvesting in kHYPE terms
+     * @dev Converts HYPE yield to kHYPE using exchange rate
+     * @return yieldInKHYPE Amount of kHYPE yield available
      */
-    function queueYieldWithdrawal() external nonReentrant returns (uint256 withdrawalId) {
-        // 0. Check cooldown period
-        if (block.timestamp < lastCompoundTimestamp + COMPOUND_COOLDOWN) {
-            revert CompoundTooSoon();
-        }
-
-        // 1. Calculate yield
+    function calculateYieldInKHYPE() public view returns (uint256 yieldInKHYPE) {
         uint256 yieldInHYPE = calculateYield();
-        if (yieldInHYPE == 0) revert NoYieldToHarvest();
+        if (yieldInHYPE == 0) return 0;
 
-        // 2. Check if yield meets minimum staking amount (required for re-minting hzUSD)
-        uint256 minStakingAmount = kinetiqIntegration.getMinStakingAmount();
-        if (yieldInHYPE < minStakingAmount) revert YieldTooSmall();
-
-        // 3. Check if worth withdrawing (yield > withdrawal fee)
-        uint256 totalUserDeposits = HypeZionExchange(hypeZionExchange).totalHYPECollateral();
-        uint256 feeRate = kinetiqIntegration.getUnstakeFeeRate();  // 0.1% = 10 bps
-        uint256 minYield = (totalUserDeposits * feeRate) / 10000;
-        if (yieldInHYPE <= minYield) revert YieldTooSmall();
-
-        // 4. Safety check: ensure remaining covers 100% redemption
-        uint256 currentValue = _getTotalHYPEValue();
-        uint256 remainingValue = currentValue - yieldInHYPE;
-        if (remainingValue < totalUserDeposits) revert InsufficientRemaining();
-
-        // 5. Convert HYPE to kHYPE for withdrawal
         uint256 exchangeRate = kinetiqIntegration.getExchangeRate();
-        uint256 khypeAmount = (yieldInHYPE * 1e18) / exchangeRate;
-
-        // 6. Request Exchange to withdraw mkHYPE from vault and transfer to Kinetiq
-        HypeZionExchange(hypeZionExchange).withdrawKHYPEForYield(khypeAmount);
-
-        // 7. Queue withdrawal from Kinetiq (mkHYPE is now in KinetiqIntegration)
-        withdrawalId = kinetiqIntegration.queueUnstakeHYPE(khypeAmount);
-
-        // 8. Track withdrawal
-        uint256 index = pendingWithdrawals.length;
-        pendingWithdrawals.push(WithdrawalRequest({
-            withdrawalId: withdrawalId,
-            kHypeAmount: 0,  // Will be calculated from hypeAmount
-            hypeAmount: yieldInHYPE,
-            queuedAt: block.timestamp,
-            claimed: false
-        }));
-        withdrawalIdToIndex[withdrawalId] = index;
-
-        // 9. Update compound timestamp to start cooldown
-        lastCompoundTimestamp = block.timestamp;
-
-        emit YieldWithdrawalQueued(withdrawalId, yieldInHYPE, block.timestamp);
-        return withdrawalId;
+        yieldInKHYPE = (yieldInHYPE * 1e18) / exchangeRate;
     }
 
     /**
-     * @notice Claim withdrawal and compound to StabilityPool (Hylo model)
-     * @dev Permissionless - can be called by anyone. Claims ready withdrawals and compounds to pool.
-     * @param withdrawalId Kinetiq withdrawal ID to claim
+     * @notice Harvest yield (Step 1): Swap kHYPE to HYPE and store for later compound
+     * @dev Restricted to OPERATOR_ROLE.
+     *      Flow: Withdraw kHYPE from vault to Swap kHYPE to HYPE via DEX to Store HYPE
+     *      Call compound() separately with fresh swap data for exact HYPE amount.
+     *
+     * @param kHypeToHypeSwapData Encoded swap data from KyberSwap API (kHYPE to HYPE)
+     * @return hypeReceived Amount of HYPE received and stored for compound
      */
-    function claimAndCompound(uint256 withdrawalId) external nonReentrant {
-        // 1. Verify withdrawal exists and is ready
-        uint256 index = withdrawalIdToIndex[withdrawalId];
-        require(index < pendingWithdrawals.length, "Invalid withdrawal index");
-        WithdrawalRequest storage request = pendingWithdrawals[index];
-        require(request.withdrawalId == withdrawalId, "Withdrawal ID mismatch");
-        if (request.claimed) revert AlreadyClaimed();
+    function harvest(
+        bytes calldata kHypeToHypeSwapData
+    ) external nonReentrant onlyRole(OPERATOR_ROLE) returns (uint256 hypeReceived) {
+        // 1. Calculate yield in kHYPE
+        uint256 yieldInKHYPE = calculateYieldInKHYPE();
+        if (yieldInKHYPE == 0) revert NoYieldToHarvest();
 
-        (bool ready, uint256 hypeAmount) = kinetiqIntegration.isUnstakeReady(withdrawalId);
-        if (!ready) revert WithdrawalNotReady();
+        // 2. Check minimum harvest amount
+        if (yieldInKHYPE < minHarvestAmount) revert YieldTooSmall();
 
-        // 2. Claim HYPE from Kinetiq
-        uint256 hypeReceived = kinetiqIntegration.claimUnstake(withdrawalId);
-        require(hypeReceived > 0, "No HYPE received");
-        if (hypeReceived != hypeAmount) revert AmountMismatch();
+        // 3. Safety check: ensure remaining covers 100% redemption
+        uint256 currentValue = _getTotalHYPEValue();
+        uint256 totalUserDeposits = HypeZionExchange(hypeZionExchange).totalHYPECollateral();
+        uint256 yieldInHYPE = calculateYield();
+        uint256 remainingValue = currentValue - yieldInHYPE;
+        if (remainingValue < totalUserDeposits) revert InsufficientRemaining();
 
-        // 3. Mint hzUSD from HYPE
+        // 4. Withdraw kHYPE from vault via Exchange (transfers kHYPE to this contract)
+        HypeZionExchange(hypeZionExchange).withdrawKHYPEForYield(yieldInKHYPE);
+
+        // 5. Get kHYPE token address
+        address kHypeToken = kinetiqIntegration.getKHypeAddress();
+
+        // 6. Swap kHYPE to HYPE via DexIntegration
+        // Transfer kHYPE to DexIntegration first (DexIntegration expects tokens to be present)
+        IERC20(kHypeToken).safeTransfer(address(dexIntegration), yieldInKHYPE);
+
+        // Execute swap: kHYPE to HYPE
+        hypeReceived = dexIntegration.executeSwap(
+            kHypeToHypeSwapData,
+            kHypeToken,           // tokenIn: kHYPE
+            NATIVE_TOKEN,         // tokenOut: HYPE (native)
+            yieldInKHYPE,         // amountIn
+            0,                    // minAmountOut (handled by swap data)
+            address(this)         // recipient
+        );
+
+        if (hypeReceived == 0) revert SwapFailed();
+
+        // 7. Store HYPE for compound step (add to any existing pending amount)
+        pendingHarvestedHype += hypeReceived;
+
+        // 8. Update harvest tracking
+        lastHarvestTimestamp = block.timestamp;
+
+        emit YieldHarvestedToStorage(yieldInKHYPE, hypeReceived, block.timestamp);
+        return hypeReceived;
+    }
+
+    /**
+     * @notice Compound stored HYPE (Step 2): Mint hzUSD and compound to StabilityPool
+     * @dev Restricted to OPERATOR_ROLE.
+     *      Flow: Use stored HYPE to Mint hzUSD to Compound to StabilityPool
+     *      Requires harvest() to be called first.
+     *
+     * @param hypeToKHypeSwapData Encoded swap data from KyberSwap API (HYPE to kHYPE for minting)
+     * @return hzusdMinted Amount of hzUSD minted and compounded
+     */
+    function compound(
+        bytes calldata hypeToKHypeSwapData
+    ) external nonReentrant onlyRole(OPERATOR_ROLE) returns (uint256 hzusdMinted) {
+        // 1. Check we have pending HYPE to compound
+        uint256 hypeAmount = pendingHarvestedHype;
+        if (hypeAmount == 0) revert NoPendingHype();
+
+        // 2. Clear pending amount before external calls (CEI pattern)
+        pendingHarvestedHype = 0;
+
+        // 3. Mint hzUSD from HYPE (includes HYPE to kHYPE swap inside mintStablecoin)
         require(hypeZionExchange != address(0), "Exchange not set");
         HypeZionExchange exchange = HypeZionExchange(payable(hypeZionExchange));
-        uint256 hzusdMinted = exchange.mintStablecoin{value: hypeReceived}(hypeReceived);
-        require(hzusdMinted > 0, "No hzUSD minted");
+        hzusdMinted = exchange.mintStablecoin{value: hypeAmount}(hypeAmount, hypeToKHypeSwapData);
+        if (hzusdMinted == 0) revert MintFailed();
 
         // 4. Transfer hzUSD to StabilityPool
         address hzusd = address(exchange.zusd());
@@ -319,149 +318,35 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
         // 5. Compound into StabilityPool (increases NAV without minting shares)
         IStabilityPool(stabilityPool).compoundYield(hzusdMinted);
 
-        // 6. Mark as claimed
-        request.claimed = true;
+        // 6. Update tracking
+        totalYieldHarvested += hypeAmount;
+        lastCompoundTimestamp = block.timestamp;
 
-        // 7. Update harvest tracking and compound timestamp
-        totalYieldHarvested += hypeReceived;
-        lastHarvestTimestamp = block.timestamp;
-        lastCompoundTimestamp = block.timestamp; // Update cooldown timer
+        emit YieldCompounded(0, hypeAmount, hzusdMinted, block.timestamp);
+        return hzusdMinted;
+    }
 
-        emit YieldCompounded(withdrawalId, hypeReceived, hzusdMinted, block.timestamp);
-    }
-    /**
-     * @notice Get current NAV data
-     * @return khypeBalance Current kHYPE balance
-     * @return hypeValue Current HYPE value
-     * @return exchangeRate Current exchange rate
-     */
-    function getCurrentNAV() external view returns (
-        uint256 khypeBalance,
-        uint256 hypeValue,
-        uint256 exchangeRate
-    ) {
-        if (navHistory.length == 0) {
-            return (0, 0, 1e18);
-        }
-        
-        NAVSnapshot memory latest = navHistory[navHistory.length - 1];
-        return (latest.khypeBalance, latest.hypeValue, latest.exchangeRate);
-    }
-    
-    /**
-     * @notice Get historical NAV at specific timestamp
-     * @param timestamp Timestamp to query
-     * @return snapshot NAV snapshot at timestamp
-     */
-    function getHistoricalNAV(uint256 timestamp) external view returns (NAVSnapshot memory) {
-        return navSnapshots[timestamp];
-    }
-    
-    /**
-     * @notice Get NAV history within time range
-     * @param fromIndex Starting index
-     * @param toIndex Ending index
-     * @return snapshots Array of NAV snapshots
-     */
-    function getNAVHistory(uint256 fromIndex, uint256 toIndex) 
-        external 
-        view 
-        returns (NAVSnapshot[] memory snapshots) 
-    {
-        require(toIndex >= fromIndex, "Invalid range");
-        require(toIndex < navHistory.length, "Index out of bounds");
-        
-        uint256 length = toIndex - fromIndex + 1;
-        snapshots = new NAVSnapshot[](length);
-        
-        for (uint256 i = 0; i < length; i++) {
-            snapshots[i] = navHistory[fromIndex + i];
-        }
-        
-        return snapshots;
-    }
-    
-    /**
-     * @notice Calculate APY based on historical NAV
-     * @param periodDays Number of days to calculate APY over
-     * @return apy Annual percentage yield (basis points)
-     */
-    function calculateAPY(uint256 periodDays) external view returns (uint256 apy) {
-        require(navHistory.length >= 2, "Insufficient history");
-        require(periodDays > 0, "Invalid period");
-        
-        uint256 periodSeconds = periodDays * 1 days;
-        uint256 currentTime = block.timestamp;
-        
-        // Find snapshot from period ago
-        NAVSnapshot memory currentSnapshot = navHistory[navHistory.length - 1];
-        NAVSnapshot memory periodSnapshot;
-        bool found = false;
-        
-        for (int256 i = int256(navHistory.length) - 2; i >= 0; i--) {
-            if (currentTime - navHistory[uint256(i)].timestamp >= periodSeconds) {
-                periodSnapshot = navHistory[uint256(i)];
-                found = true;
-                break;
-            }
-        }
-        
-        if (!found) {
-            periodSnapshot = navHistory[0];
-        }
-        
-        // Calculate yield over period
-        if (periodSnapshot.exchangeRate == 0) return 0;
-        
-        uint256 periodYield = ((currentSnapshot.exchangeRate - periodSnapshot.exchangeRate) * 10000) / 
-                              periodSnapshot.exchangeRate;
-        
-        // Annualize
-        uint256 periodsPerYear = 365 days / (currentTime - periodSnapshot.timestamp);
-        apy = periodYield * periodsPerYear;
-        
-        return apy;
-    }
-    
-    /**
-     * @notice Set harvest interval
-     * @param newInterval New interval in seconds
-     */
-    function setHarvestInterval(uint256 newInterval) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newInterval == 0) revert InvalidInterval();
-        
-        uint256 oldInterval = harvestInterval;
-        harvestInterval = newInterval;
-        
-        emit HarvestIntervalUpdated(oldInterval, newInterval);
-    }
-    
     /**
      * @notice Set NAV alert threshold
      * @param newThreshold New threshold (18 decimals, e.g., 0.95e18 for 95%)
      */
     function setNAVAlertThreshold(uint256 newThreshold) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newThreshold == 0 || newThreshold > 1e18) revert InvalidThreshold();
-        
+
         uint256 oldThreshold = navAlertThreshold;
         navAlertThreshold = newThreshold;
-        
+
         emit NAVAlertThresholdUpdated(oldThreshold, newThreshold);
     }
-    
+
     /**
-     * @notice Check if harvest is available
+     * @notice Check if harvest is available and worthwhile
      * @return canHarvestNow Whether harvest can be performed
-     * @return timeUntilNext Time until next harvest (0 if can harvest now)
+     * @return yieldAmount Current yield available in kHYPE
      */
-    function canHarvest() external view returns (bool canHarvestNow, uint256 timeUntilNext) {
-        uint256 nextHarvestTime = lastHarvestTimestamp + harvestInterval;
-        
-        if (block.timestamp >= nextHarvestTime) {
-            return (true, 0);
-        } else {
-            return (false, nextHarvestTime - block.timestamp);
-        }
+    function canHarvest() external view returns (bool canHarvestNow, uint256 yieldAmount) {
+        yieldAmount = calculateYieldInKHYPE();
+        canHarvestNow = yieldAmount >= minHarvestAmount;
     }
 
     /**
@@ -485,78 +370,22 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
     }
 
     /**
-     * @notice Get pending withdrawals that are ready to claim
-     * @return claimable Array of claimable withdrawal requests
+     * @notice Set DEX integration contract address
+     * @param _dexIntegration Address of DexIntegration contract
      */
-    function getClaimableWithdrawals() external view returns (WithdrawalRequest[] memory claimable) {
-        uint256 count = 0;
-        for (uint256 i = 0; i < pendingWithdrawals.length; i++) {
-            if (!pendingWithdrawals[i].claimed) {
-                (bool ready,) = kinetiqIntegration.isUnstakeReady(pendingWithdrawals[i].withdrawalId);
-                if (ready) count++;
-            }
-        }
-
-        claimable = new WithdrawalRequest[](count);
-        uint256 index = 0;
-        for (uint256 i = 0; i < pendingWithdrawals.length; i++) {
-            if (!pendingWithdrawals[i].claimed) {
-                (bool ready,) = kinetiqIntegration.isUnstakeReady(pendingWithdrawals[i].withdrawalId);
-                if (ready) {
-                    claimable[index] = pendingWithdrawals[i];
-                    index++;
-                }
-            }
-        }
+    function setDexIntegration(address _dexIntegration) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_dexIntegration == address(0)) revert InvalidAddress();
+        dexIntegration = IDexIntegration(_dexIntegration);
+        emit DexIntegrationSet(_dexIntegration);
     }
 
     /**
-     * @notice Get all pending (unclaimed) withdrawals
-     * @return pending Array of pending withdrawal requests
+     * @notice Set minimum harvest amount
+     * @param _amount Minimum kHYPE amount required to harvest
      */
-    function getPendingWithdrawals() external view returns (WithdrawalRequest[] memory pending) {
-        uint256 count = 0;
-        for (uint256 i = 0; i < pendingWithdrawals.length; i++) {
-            if (!pendingWithdrawals[i].claimed) count++;
-        }
-
-        pending = new WithdrawalRequest[](count);
-        uint256 index = 0;
-        for (uint256 i = 0; i < pendingWithdrawals.length; i++) {
-            if (!pendingWithdrawals[i].claimed) {
-                pending[index] = pendingWithdrawals[i];
-                index++;
-            }
-        }
-    }
-
-    /**
-     * @notice Get comprehensive yield analytics
-     * @return currentYield Current yield available for harvest
-     * @return totalDeposits Total user deposits (principal)
-     * @return currentValue Current kHYPE value in HYPE
-     * @return pendingWithdrawalsCount Number of pending withdrawals
-     * @return totalHarvested Total yield harvested all-time
-     */
-    function getYieldAnalytics() external view returns (
-        uint256 currentYield,
-        uint256 totalDeposits,
-        uint256 currentValue,
-        uint256 pendingWithdrawalsCount,
-        uint256 totalHarvested
-    ) {
-        currentYield = calculateYield();
-        totalDeposits = HypeZionExchange(hypeZionExchange).totalHYPECollateral();
-        currentValue = _getTotalHYPEValue();
-
-        // Count unclaimed withdrawals
-        uint256 count = 0;
-        for (uint256 i = 0; i < pendingWithdrawals.length; i++) {
-            if (!pendingWithdrawals[i].claimed) count++;
-        }
-        pendingWithdrawalsCount = count;
-
-        totalHarvested = totalYieldHarvested;
+    function setMinHarvestAmount(uint256 _amount) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        minHarvestAmount = _amount;
+        emit MinHarvestAmountSet(_amount);
     }
 
     /**

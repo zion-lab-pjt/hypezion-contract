@@ -38,19 +38,37 @@ contract StakedHzUSD is
     uint256 public hzusdInPool;          // HzUSD amount in pool
     uint256 public hzhypeInPool;         // hzHYPE amount in pool
 
+    // Unstake fee configuration (basis points, 10000 = 100%)
+    // All tiers set to same value (0.1%) - can be adjusted per-tier in future if needed
+    uint256 public unstakeFeeHealthy;    // Default: 10 (0.1%) when CR >= 150%
+    uint256 public unstakeFeeCautious;   // Default: 10 (0.1%) when 130% <= CR < 150%
+    uint256 public unstakeFeeCritical;   // Default: 10 (0.1%) when CR < 130%
+
+    address public interventionManager;
+
+    // Accumulated unstake fees pending admin collection
+    uint256 public accumulatedUnstakeFees;        // hzUSD fees pending collection
+    uint256 public accumulatedUnstakeFeesXHYPE;   // hzHYPE fees pending collection (recovery mode)
+
     // Events (additional to IStabilityPool)
     event ProtocolSet(address indexed newProtocol);
     event XHYPESet(address indexed newXHYPE);
     event YieldManagerSet(address indexed newYieldManager);
+    event InterventionManagerSet(address indexed newInterventionManager);
     event Deposited(address indexed receiver, uint256 assets, uint256 shares);
     event Withdrawn(address indexed owner, address indexed receiver, uint256 assets, uint256 shares);
+    event MixedWithdrawn(address indexed owner, address indexed receiver, uint256 hzusdAmount, uint256 bullhypeAmount, uint256 totalValue, uint256 shares);
+    event UnstakeFeeCharged(address indexed owner, uint256 fee, uint256 feeBps);
+    event UnstakeFeesUpdated(uint256 feeHealthy, uint256 feeCautious, uint256 feeCritical);
+    event UnstakeFeesCollected(address indexed recipient, uint256 hzusdAmount, uint256 xhypeAmount);
 
     // Custom errors (additional to IStabilityPool)
     error ZeroAddress();
     error InvalidInterventionAmount();
+    error FeeTooHigh();
 
     // Storage gap for future upgrades
-    uint256[50] private __gap;
+    uint256[36] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -72,21 +90,11 @@ contract StakedHzUSD is
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATOR_ROLE, msg.sender);
-    }
 
-    /**
-     * @notice Bootstrap roles after upgrade from Ownable version
-     * @dev One-time function to grant roles after upgrading to AccessControl
-     *      Can only be called once by anyone, grants roles to caller
-     *      Required because upgraded contracts don't have initialize() called again
-     */
-    function bootstrapRoles() external {
-        // Check if roles are already set (prevents calling this multiple times)
-        require(!hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Roles already bootstrapped");
-
-        // Grant both roles to the caller (should be deployer/admin)
-        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
-        _grantRole(OPERATOR_ROLE, msg.sender);
+        // Default unstake fees - all set to 0.1% (can be adjusted per-tier if needed)
+        unstakeFeeHealthy = 10;   // 0.1%
+        unstakeFeeCautious = 10;  // 0.1%
+        unstakeFeeCritical = 10;  // 0.1%
     }
 
     /**
@@ -120,12 +128,46 @@ contract StakedHzUSD is
     }
 
     /**
+     * @notice Set the intervention manager address that can trigger interventions
+     * @param _interventionManager Address of the InterventionManager contract
+     */
+    function setInterventionManager(address _interventionManager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_interventionManager == address(0)) revert ZeroAddress();
+        interventionManager = _interventionManager;
+        emit InterventionManagerSet(_interventionManager);
+    }
+
+    /**
+     * @notice Set unstake fee configuration
+     * @dev Fees are in basis points (10000 = 100%). Max 1% (100 bps) per tier.
+     * @param _feeHealthy Fee when system is healthy (CR >= 150%)
+     * @param _feeCautious Fee when system is cautious (130% <= CR < 150%)
+     * @param _feeCritical Fee when system is critical (CR < 130%)
+     */
+    function setUnstakeFees(
+        uint256 _feeHealthy,
+        uint256 _feeCautious,
+        uint256 _feeCritical
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // Max 1% (100 bps) per tier for safety
+        if (_feeHealthy > 100 || _feeCautious > 100 || _feeCritical > 100) {
+            revert FeeTooHigh();
+        }
+
+        unstakeFeeHealthy = _feeHealthy;
+        unstakeFeeCautious = _feeCautious;
+        unstakeFeeCritical = _feeCritical;
+
+        emit UnstakeFeesUpdated(_feeHealthy, _feeCautious, _feeCritical);
+    }
+
+    /**
      * @notice Protocol intervention to convert hzUSD to hzHYPE when CR < 130%
      * @param amountToConvert Amount of hzUSD to convert to hzHYPE
      * @param zhypeReceived Amount of hzHYPE received from conversion
      */
     function protocolIntervention(uint256 amountToConvert, uint256 zhypeReceived) external payable override {
-        if (msg.sender != protocol) revert InvalidCaller(msg.sender);
+        if (msg.sender != interventionManager) revert InvalidCaller(msg.sender);
         if (amountToConvert > totalAssets()) revert InsufficientPoolBalance(amountToConvert, totalAssets());
 
         // Validate received amount
@@ -154,7 +196,7 @@ contract StakedHzUSD is
      * @param zusdMinted Amount of hzUSD minted to pool
      */
     function exitRecoveryMode(uint256 zhypeBurned, uint256 zusdMinted) external override {
-        if (msg.sender != protocol) revert InvalidCaller(msg.sender);
+        if (msg.sender != interventionManager) revert InvalidCaller(msg.sender);
 
         // Validate amounts
         if (zhypeBurned > hzhypeInPool) {
@@ -254,6 +296,32 @@ contract StakedHzUSD is
         return totalXHYPEFromIntervention;
     }
 
+    // =============================
+    // ===== UNSTAKE FEE LOGIC =====
+    // =============================
+
+    /**
+     * @notice Get current unstake fee based on system health
+     * @dev All tiers currently set to 0.1% - can be adjusted per-tier if needed
+     * @return feeBps Current fee in basis points
+     */
+    function getUnstakeFee() public view returns (uint256 feeBps) {
+        // If protocol not set or fees not initialized, return 0
+        if (protocol == address(0) || unstakeFeeHealthy == 0) {
+            return 0;
+        }
+
+        IHypeZionExchange.SystemState state = IHypeZionExchange(protocol).systemState();
+
+        if (state == IHypeZionExchange.SystemState.Normal) {
+            return unstakeFeeHealthy;
+        } else if (state == IHypeZionExchange.SystemState.Cautious) {
+            return unstakeFeeCautious;
+        } else {
+            return unstakeFeeCritical;
+        }
+    }
+
     /**
      * @notice Preview withdrawal with recovery mode asset breakdown
      */
@@ -299,6 +367,8 @@ contract StakedHzUSD is
 
     /**
      * @notice Withdraw with recovery mode asset breakdown (proportional distribution)
+     * @notice Applies unstake fee to both stablecoin and levercoin portions
+     * @notice Fees are tracked separately for admin collection via collectUnstakeFees()
      */
     function mixedWithdraw(
         uint256 shares,
@@ -312,30 +382,46 @@ contract StakedHzUSD is
             revert InvalidReceiver();
         }
 
-        // Get current breakdown
-        (stablecoinAmount, levercoinAmount, totalValue) = this.previewMixedRedeem(shares);
+        // Get gross breakdown (before fees)
+        uint256 grossStablecoin;
+        uint256 grossLevercoin;
+        (grossStablecoin, grossLevercoin, totalValue) = this.previewMixedRedeem(shares);
+
+        // Calculate unstake fee
+        uint256 feeBps = getUnstakeFee();
+        uint256 stablecoinFee = (grossStablecoin * feeBps) / 10000;
+        uint256 levercoinFee = (grossLevercoin * feeBps) / 10000;
+
+        // Calculate net amounts after fee
+        stablecoinAmount = grossStablecoin - stablecoinFee;
+        levercoinAmount = grossLevercoin - levercoinFee;
 
         // Burn LP tokens
         _burn(msg.sender, shares);
 
-        // Calculate fees (if any)
-        uint256 stablecoinFees = 0; // Could implement withdrawal fees later
-        uint256 netStablecoin = stablecoinAmount - stablecoinFees;
-
-        // Transfer assets
-        if (netStablecoin > 0) {
-            IERC20(asset()).transfer(receiver, netStablecoin);
+        // Transfer net assets to receiver
+        if (stablecoinAmount > 0) {
+            IERC20(asset()).transfer(receiver, stablecoinAmount);
         }
 
         if (levercoinAmount > 0) {
             IERC20(xhype).transfer(receiver, levercoinAmount);
         }
 
-        // Update tracking
-        hzusdInPool -= stablecoinAmount;
-        hzhypeInPool -= levercoinAmount;
+        // Update tracking: deduct gross amounts (net + fee) from pool
+        // Fees are tracked separately and do NOT inflate totalAssets/share price
+        hzusdInPool -= grossStablecoin;
+        hzhypeInPool -= grossLevercoin;
+        accumulatedUnstakeFees += stablecoinFee;
+        accumulatedUnstakeFeesXHYPE += levercoinFee;
 
-        emit Withdrawn(msg.sender, receiver, totalValue, shares);
+        emit MixedWithdrawn(msg.sender, receiver, stablecoinAmount, levercoinAmount, totalValue, shares);
+
+        // Emit fee event if any fees charged
+        uint256 totalFee = stablecoinFee + levercoinFee;
+        if (totalFee > 0) {
+            emit UnstakeFeeCharged(msg.sender, stablecoinFee, feeBps);
+        }
     }
 
     /**
@@ -392,22 +478,62 @@ contract StakedHzUSD is
     }
 
     /**
-     * @dev Override withdraw to track assets
+     * @dev Override withdraw to track assets and apply unstake fee
+     * @notice User specifies net assets to receive; additional shares burned to cover fee
+     * @notice Fee is tracked separately and collected by admin via collectUnstakeFees()
      */
     function withdraw(
         uint256 assets,
         address receiver,
         address owner
     ) public override(ERC4626Upgradeable, IERC4626) nonReentrant returns (uint256 shares) {
-        if (assets > totalAssets()) revert InsufficientPoolBalance(assets, totalAssets());
-        shares = super.withdraw(assets, receiver, owner);
-        hzusdInPool -= assets;
+        // Calculate fee and gross assets needed
+        uint256 feeBps = getUnstakeFee();
+        uint256 grossAssets;
+        uint256 fee;
+
+        if (feeBps > 0) {
+            // gross = net * 10000 / (10000 - fee)
+            if (feeBps >= 10000) revert FeeTooHigh();
+            grossAssets = (assets * 10000) / (10000 - feeBps);
+            fee = grossAssets - assets;
+        } else {
+            grossAssets = assets;
+            fee = 0;
+        }
+
+        if (grossAssets > totalAssets()) revert InsufficientPoolBalance(grossAssets, totalAssets());
+
+        // Calculate shares needed for gross assets
+        shares = previewWithdraw(grossAssets);
+
+        // Handle allowance for non-owner callers
+        if (msg.sender != owner) {
+            _spendAllowance(owner, msg.sender, shares);
+        }
+
+        // Burn shares
+        _burn(owner, shares);
+
+        // Transfer net assets to receiver
+        IERC20(asset()).transfer(receiver, assets);
+
+        // Update pool tracking: deduct gross amount (net + fee) from pool
+        // Fee is tracked separately and does NOT inflate totalAssets/share price
+        hzusdInPool -= grossAssets;
+        accumulatedUnstakeFees += fee;
+
         emit Withdrawn(owner, receiver, assets, shares);
+        if (fee > 0) {
+            emit UnstakeFeeCharged(owner, fee, feeBps);
+        }
+
         return shares;
     }
 
     /**
-     * @dev Override redeem to track assets
+     * @dev Override redeem to track assets and apply unstake fee
+     * @notice Fee is charged on withdrawal and tracked separately for admin collection
      */
     function redeem(
         uint256 shares,
@@ -419,10 +545,36 @@ contract StakedHzUSD is
             revert MixedAssetQuoteFailure();
         }
 
-        assets = super.redeem(shares, receiver, owner);
-        if (assets > totalAssets()) revert InsufficientPoolBalance(assets, totalAssets());
-        hzusdInPool -= assets;
+        // Calculate gross assets for the shares
+        uint256 grossAssets = previewRedeem(shares);
+        if (grossAssets > totalAssets()) revert InsufficientPoolBalance(grossAssets, totalAssets());
+
+        // Calculate and apply unstake fee
+        uint256 feeBps = getUnstakeFee();
+        uint256 fee = (grossAssets * feeBps) / 10000;
+        assets = grossAssets - fee;
+
+        // Handle allowance for non-owner callers
+        if (msg.sender != owner) {
+            _spendAllowance(owner, msg.sender, shares);
+        }
+
+        // Burn shares
+        _burn(owner, shares);
+
+        // Transfer net assets to receiver
+        IERC20(asset()).transfer(receiver, assets);
+
+        // Update pool tracking: deduct gross amount (net + fee) from pool
+        // Fee is tracked separately and does NOT inflate totalAssets/share price
+        hzusdInPool -= grossAssets;
+        accumulatedUnstakeFees += fee;
+
         emit Withdrawn(owner, receiver, assets, shares);
+        if (fee > 0) {
+            emit UnstakeFeeCharged(owner, fee, feeBps);
+        }
+
         return assets;
     }
 
@@ -437,6 +589,29 @@ contract StakedHzUSD is
         hzusdInPool += assets;
         emit Deposited(receiver, assets, shares);
         return assets;
+    }
+
+    /**
+     * @notice Collect accumulated unstake fees
+     * @dev Transfers accumulated hzUSD and hzHYPE fees to the specified recipient
+     * @param recipient Address to receive the collected fees
+     */
+    function collectUnstakeFees(address recipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (recipient == address(0)) revert ZeroAddress();
+
+        uint256 hzusdFees = accumulatedUnstakeFees;
+        uint256 xhypeFees = accumulatedUnstakeFeesXHYPE;
+
+        if (hzusdFees > 0) {
+            accumulatedUnstakeFees = 0;
+            IERC20(asset()).transfer(recipient, hzusdFees);
+        }
+        if (xhypeFees > 0 && xhype != address(0)) {
+            accumulatedUnstakeFeesXHYPE = 0;
+            IERC20(xhype).transfer(recipient, xhypeFees);
+        }
+
+        emit UnstakeFeesCollected(recipient, hzusdFees, xhypeFees);
     }
 
     /**
