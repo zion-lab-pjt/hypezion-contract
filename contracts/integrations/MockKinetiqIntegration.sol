@@ -60,14 +60,14 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
     event ExchangeSet(address indexed exchange);
     event HYPEWithdrawnForSwap(address indexed router, uint256 amount);
     event MockRouterSet(address indexed router);
-    
+
     // Custom errors
     error InvalidAmount(uint256 amount, uint256 minimum);
     error InvalidRange(uint256 value, uint256 min, uint256 max);
     error UnauthorizedCaller(address caller);
     error ZeroAddress();
     error StakingFailed(string reason);
-    
+
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
         _disableInitializers(); // Prevent initialization of implementation contract
@@ -124,7 +124,7 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         if (_yieldManager == address(0)) revert ZeroAddress();
         yieldManager = _yieldManager;
     }
-    
+
     /**
      * @notice Stake HYPE tokens through Kinetiq StakingManager
      * @param amount Amount of HYPE to stake
@@ -152,14 +152,14 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         uint256 currentRate = _calculateExchangeRate();
         kHYPEReceived = (amount * 1e18) / currentRate;
 
-        // ✅ NEW: Mint mkHYPE tokens and transfer to Exchange
+        // Mint mkHYPE tokens and transfer to Exchange
         mockKHYPE.mint(address(this), kHYPEReceived);
         IERC20(address(mockKHYPE)).safeTransfer(hypeNovaExchange, kHYPEReceived);
 
         emit HYPEStaked(amount, kHYPEReceived);
         return kHYPEReceived;
     }
-    
+
     /**
      * @notice Get staked amount for an address
      * @param account Address to query
@@ -168,7 +168,7 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
     function getStakedAmount(address account) external view returns (uint256) {
         return stakedAmounts[account];
     }
-    
+
     /**
      * @notice Get kHYPE balance held by this contract
      * @return kHYPE token balance
@@ -255,7 +255,7 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
     function updateYield() external {
         _updateYield();
     }
-    
+
     /**
      * @notice Queue kHYPE unstaking request (mock version)
      * @dev In production, this calls StakingManager.queueWithdrawal with kHYPE amount
@@ -279,8 +279,8 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         withdrawalQueuedAt[withdrawalId] = block.timestamp; // Track when withdrawal was queued
 
         // Note: totalStaked is NOT reduced here - it's reduced when claimed
-        // This matches the Exchange behavior where totalHYPECollateral is reduced on claim
-        // Otherwise we get a timing mismatch: NAV drops immediately but collateral stays high
+        // Note: Exchange.totalHYPECollateral IS reduced at queue time (_executeRedeem)
+        // because kHYPE leaves the vault immediately and no longer earns yield.
 
         // Burn the mkHYPE tokens (simulate Kinetiq burning kHYPE)
         mockKHYPE.burn(khypeAmount);
@@ -315,8 +315,8 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         hypeReceived = expectedAmount;
 
         // Reduce totalStaked when claiming (not when queuing)
-        // This matches Exchange behavior where totalHYPECollateral is reduced on claim
-        // Ensures NAV and collateral stay synchronized
+        // Note: Exchange.totalHYPECollateral is reduced at queue time, but
+        // MockKinetiqIntegration.totalStaked is reduced here at claim time.
         if (totalStaked >= hypeReceived) {
             totalStaked -= hypeReceived;
         }
@@ -373,7 +373,7 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
     function getMinStakingAmount() external view returns (uint256) {
         return minStakingAmount;
     }
-    
+
     /**
      * @notice Set minimum staking amount (admin only)
      * @param newMinAmount New minimum staking amount
@@ -417,7 +417,7 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         // For testing, always return true
         return true;
     }
-    
+
     /**
      * @notice Simulate receiving staked tokens (for testing only)
      * @dev This function would not exist in production
@@ -463,6 +463,16 @@ contract MockKinetiqIntegration is IKinetiqIntegration, AccessControlUpgradeable
         if (_mockRouter == address(0)) revert ZeroAddress();
         mockRouter = _mockRouter;
         emit MockRouterSet(_mockRouter);
+    }
+
+    /**
+     * @notice Set MockKHYPE token address (testnet only)
+     * @dev Allows updating to a new MockKHYPE contract after deployment
+     * @param _mockKHYPE Address of new MockKHYPE token
+     */
+    function setMockKHYPE(address _mockKHYPE) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_mockKHYPE == address(0)) revert ZeroAddress();
+        mockKHYPE = MockKHYPE(_mockKHYPE);
     }
 
     /**

@@ -46,7 +46,7 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     uint256 public constant MOCK_WITHDRAWAL_DELAY = 30 seconds; // For testing
 
     // Yield settlement
-    uint256 public constant MIN_YIELD_TO_SETTLE = 0.1 ether;    // Minimum 0.1 HYPE worth of yield
+    uint256 public constant MIN_YIELD_TO_SETTLE = 0.1 ether;    // DEPRECATED: was used by removed _settleYieldIfNeeded
 
     // DEX integration
     address public constant NATIVE_HYPE = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
@@ -75,7 +75,7 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     uint256 public totalHYPECollateral;   // Total HYPE staked
     uint256 public totalKHYPEBalance;     // Available kHYPE
     uint256 public lockedKHYPEBalance;    // kHYPE locked for pending redemptions
-    uint256 public accumulatedFees;       // Protocol fees accumulated (in ZUSD units)
+    uint256 public accumulatedFees;       // Protocol fees accumulated (in kHYPE units)
     uint256 public totalHypeDeposited;    // Total deposits (for max limit tracking)
 
     // ========================
@@ -84,13 +84,15 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     IHypeZionExchange.MinimumAmounts public minimumAmounts;
     uint256 public maxTotalDeposit;  // Maximum deposit cap
 
-    // Fee configuration (basis points) - admin configurable
-    uint256 public feeHealthy;                // 0.3% when CR >= 150% (default: 30)
-    uint256 public feeCautious;               // 0.2% when 130% <= CR < 150% (default: 20)
-    uint256 public feeCritical;               // 0.1% when CR < 130% (default: 10)
+    // DEPRECATED, use _bullHYPEFees and _hzUSDFees
+    uint256 public feeHealthy;
+    uint256 public feeCautious;
+    uint256 public feeCritical;
 
-    // SwapRedeem configuration - admin configurable
-    uint256 public swapRedeemFeeBps;          // Fee for swap redeem operations (default: 500 = 5%)
+    // DEPRECATED, use _bullHYPEFees and _hzUSDFees
+    uint256 public swapRedeemFeeBps;
+
+    // SwapRedeem configuration - max rate divergenceBps
     uint256 public maxRateDivergenceBps;      // Max allowed rate divergence (default: 1000 = 10%)
 
     // ======================
@@ -100,11 +102,20 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
 
     // ========================
     // === WITHDRAWALS ========
-    // ========================
     HypeZionWithdrawalManagerLibrary.WithdrawalStorage private withdrawals;
 
-    // Storage gap for future upgrades (UUPS pattern)
-    uint256[50] private __gap;
+    // DEPRECATED, use _bullHYPEFees and _hzUSDFees
+    uint256 public swapMintFeeBps;
+
+    // Token-specific fees
+    IHypeZionExchange.TokenFees internal _bullHYPEFees;
+    IHypeZionExchange.TokenFees internal _hzUSDFees;
+
+    // InterventionManager - authorized to perform interventions via this contract
+    address public interventionManager;
+
+    // Storage gap for future upgrades
+    uint256[46] private __gap;
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -145,39 +156,18 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         hypeZionVault = IHypeZionVault(_vault);
         dexIntegration = IDexIntegration(_dexIntegration);
 
-        // Initialize state variables
-        systemState = IHypeZionExchange.SystemState.Normal;
+        // Note: minimumAmounts, maxTotalDeposit, maxRateDivergenceBps,
+        // _bullHYPEFees, _hzUSDFees are configured via setup script
+        // (scripts/deploy/09-setup-configuration.js)
 
-        // Initialize minimum amounts (testnet defaults - 0.01 for all)
-        minimumAmounts = MinimumAmounts({
-            mintHypeMin: 0.01 ether,      // 0.01 HYPE for testing
-            redeemZusdMin: 0.01 ether,    // 0.01 zUSD for testing
-            redeemZhypeMin: 0.01 ether,   // 0.01 zHYPE for testing
-            swapZusdMin: 0.01 ether,      // 0.01 zUSD for testing
-            swapZhypeMin: 0.01 ether      // 0.01 zHYPE for testing
-        });
-
-        // Initialize maximum limits (testnet defaults - 1M HYPE cap)
-        maxTotalDeposit = 1_000_000 ether;  // 1M HYPE system-wide deposit cap for testing
-        totalHypeDeposited = 0;  // Start with no deposits
-
-        // Initialize fee configuration (default values)
-        feeHealthy = 30;                  // 0.3% when CR >= 150%
-        feeCautious = 20;                 // 0.2% when 130% <= CR < 150%
-        feeCritical = 10;                 // 0.1% when CR < 130%
-
-        // Initialize swap redeem configuration
-        swapRedeemFeeBps = 500;           // 5% fee
-        maxRateDivergenceBps = 1000;      // 10% max divergence
-
-        // Initialize withdrawal manager
+        // Initialize withdrawal manager (must be here — sets nextWithdrawalId=1)
         withdrawals.initialize(MOCK_WITHDRAWAL_DELAY);
     }
 
     // =====================
     // ====== NAV ======
     // =====================
-    
+
     /**
      * @notice Calculate zUSD NAV in HYPE (zUSD = $1 fixed)
      * @return nav zUSD NAV in HYPE (1e18 scaled)
@@ -185,13 +175,13 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     function getZusdNavInHYPE() public view returns (uint256 nav) {
         IOracle.PriceData memory hypePrice = oracle.getPrice("HYPE");
         if (hypePrice.price == 0) revert OraclePriceInvalid();
-        
+
         // zUSD is $1, so NAV = 1 / HYPE_USD_price
         // nav = (1 USD) / (USD per HYPE) = HYPE
         // Scale to 1e18: nav = 1e18 / hypePrice.price
         nav = (PRECISION * PRECISION) / hypePrice.price;
     }
-    
+
     /**
      * @notice Calculate total reserves in HYPE (includes locked kHYPE for pending redemptions)
      * @dev Used for CR calculation - must include ALL protocol assets
@@ -207,7 +197,7 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
 
         return hypeFromStaking;
     }
-    
+
     /**
      * @notice Calculate available reserves in HYPE (excludes locked kHYPE)
      * @dev Used for checking if redemptions can be processed
@@ -230,14 +220,24 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
      * @return Total zUSD liabilities valued in HYPE
      */
     function getZusdLiabilitiesInHYPE() public view returns (uint256) {
+        IOracle.PriceData memory priceData = oracle.getPrice("HYPE");
+        if (priceData.price == 0) revert OraclePriceInvalid();
+        return _getZusdLiabilitiesWithPrice(priceData.price);
+    }
+
+    /**
+     * @notice Calculate zUSD liabilities using provided HYPE price
+     * @param hypePrice HYPE price from oracle
+     * @return Total zUSD liabilities valued in HYPE
+     */
+    function _getZusdLiabilitiesWithPrice(uint256 hypePrice) internal view returns (uint256) {
         uint256 zusdSupply = zusd.totalSupply();
         if (zusdSupply == 0) return 0;
 
-        uint256 zusdNav = getZusdNavInHYPE();
-        // liabilities = zusd_supply * zusd_nav_in_hype
+        uint256 zusdNav = (PRECISION * PRECISION) / hypePrice;
         return (zusdSupply * zusdNav) / PRECISION;
     }
-    
+
     /**
      * @notice Calculate zHYPE NAV in HYPE using Hylo's invariant
      * @return nav zHYPE NAV in HYPE (1e18 scaled)
@@ -310,44 +310,76 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         // Scale to basis points (10000 = 100%)
         return (totalReserve * BASIS_POINTS) / zusdLiabilities;
     }
-    
-    /**
-     * @notice Get current fee based on system CR
-     * @return fee in basis points
-     */
-    function getCurrentFee() public view returns (uint256) {
-        uint256 cr = getSystemCR();
 
-        if (cr >= NORMAL_CR_THRESHOLD) {
-            return feeHealthy;  // Healthy mode
-        } else if (cr >= CAUTIOUS_CR_THRESHOLD) {
-            return feeCautious; // Cautious mode
+    /**
+     * @notice Calculate system CR using provided HYPE price
+     * @param hypePrice HYPE price from oracle
+     * @return System CR (1e4 scale, 10000 = 100%)
+     */
+    function _getSystemCRWithPrice(uint256 hypePrice) internal view returns (uint256) {
+        uint256 zusdLiabilities = _getZusdLiabilitiesWithPrice(hypePrice);
+
+        // If no liabilities, CR is infinite (return max safe value)
+        if (zusdLiabilities == 0) {
+            return type(uint256).max;
+        }
+
+        uint256 totalReserve = getTotalReserveInHYPE();
+
+        // CR = Reserve / Liabilities * 100%
+        // Scale to basis points (10000 = 100%)
+        return (totalReserve * BASIS_POINTS) / zusdLiabilities;
+    }
+
+    /**
+     * @notice Get fee for a specific token and operation based on current CR
+     * @param isZusd True for hzUSD operations, false for bullHYPE operations
+     * @param isMint True for mint operations, false for redeem operations
+     * @return Fee in basis points
+     */
+    function getProtocolFee(bool isZusd, bool isMint) public view returns (uint256) {
+        uint256 cr = getSystemCR();
+        return _getProtocolFeeWithCR(isZusd, isMint, cr);
+    }
+
+    /**
+     * @notice Internal fee lookup with cached CR
+     * @param isZusd True for hzUSD operations, false for bullHYPE operations
+     * @param isMint True for mint operations, false for redeem operations
+     * @param cr Current system collateral ratio
+     * @return Fee in basis points
+     */
+    function _getProtocolFeeWithCR(bool isZusd, bool isMint, uint256 cr) internal view returns (uint256) {
+        IHypeZionExchange.TokenFees storage fees = isZusd ? _hzUSDFees : _bullHYPEFees;
+
+        if (isMint) {
+            if (cr >= NORMAL_CR_THRESHOLD) return fees.mintHealthy;
+            if (cr >= CAUTIOUS_CR_THRESHOLD) return fees.mintCautious;
+            return fees.mintCritical;
         } else {
-            return feeCritical; // Critical mode
+            if (cr >= NORMAL_CR_THRESHOLD) return fees.redeemHealthy;
+            if (cr >= CAUTIOUS_CR_THRESHOLD) return fees.redeemCautious;
+            return fees.redeemCritical;
         }
     }
 
-    
     // =====================
     // ====== MINTING ======
     // =====================
-    
+
     /**
-     * @notice Mint zHYPE leveraged tokens by staking HYPE
-     * @param amountHYPE Amount of HYPE to stake
+     * @notice Mint zHYPE leveraged tokens by staking or swapping HYPE to kHYPE
+     * @dev If swapData is empty, uses Kinetiq staking (no slippage, min 5 HYPE, dynamic fee)
+     *      If swapData is provided, uses DEX swap (flexible, slippage protected, fixed fee)
+     * @param amountHYPE Amount of HYPE to convert
+     * @param swapData Encoded swap data from KyberSwap API (empty for Kinetiq staking)
      * @return zhypeMinted Amount of zHYPE minted
      */
-    function mintLevercoin(uint256 amountHYPE) external payable nonReentrant whenNotPaused returns (uint256 zhypeMinted) {
+    function mintLevercoin(uint256 amountHYPE, bytes calldata swapData) external payable nonReentrant whenNotPaused returns (uint256 zhypeMinted) {
         if (msg.value != amountHYPE) revert IncorrectHYPEAmount();
 
         // Check our protocol minimum
         if (amountHYPE < minimumAmounts.mintHypeMin) revert BelowMinimumAmount();
-
-        // Also check Kinetiq minimum (if different)
-        uint256 kinetiqMin = kinetiq.getMinStakingAmount();
-        if (amountHYPE < kinetiqMin) {
-            revert MinimumStakingAmountNotMet(amountHYPE, kinetiqMin);
-        }
 
         // Check maximum total deposit limit
         uint256 newTotal = totalHypeDeposited + amountHYPE;
@@ -355,75 +387,69 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             revert MaximumDepositExceeded(newTotal, maxTotalDeposit);
         }
 
-        // Calculate pre-deposit NAV
+        // Get HYPE price from oracle
+        uint256 hypePrice = oracle.getPrice("HYPE").price;
+        if (hypePrice == 0) revert OraclePriceInvalid();
+
+        // Get fee basis points based on current CR
+        uint256 cr = _getSystemCRWithPrice(hypePrice);
+        uint256 feeBps = _getProtocolFeeWithCR(false, true, cr);  // bullHYPE, mint
+
+        // Calculate pre-deposit NAV (must be before deposit changes reserves)
         uint256 navBefore = getZhypeNavInHYPE();
-        uint256 zusdNav = getZusdNavInHYPE();
 
-        // Get current fee based on CR
-        uint256 feeBps = getCurrentFee();
+        // Stake ALL HYPE, then split kHYPE into fee + collateral
+        uint256 kHYPEReceived = _obtainKHYPE(amountHYPE, swapData);
+        uint256 feeKHYPE = (kHYPEReceived * feeBps) / BASIS_POINTS;
+        uint256 netKHYPE = kHYPEReceived - feeKHYPE;
+        accumulatedFees += feeKHYPE;
 
-        // Calculate minted amount at pre-deposit NAV
-        // minted = deposit / nav * (1 - fee)
-        zhypeMinted = (amountHYPE * PRECISION) / navBefore;
-        uint256 fee = (zhypeMinted * feeBps) / BASIS_POINTS;
-        zhypeMinted -= fee;
+        // Mint zHYPE based on actual net kHYPE value (tied to execution, respects slippage)
+        uint256 exchangeRate = kinetiq.getExchangeRate();
+        uint256 actualHypeValue = (netKHYPE * exchangeRate) / PRECISION;
+        zhypeMinted = (actualHypeValue * PRECISION) / navBefore;
 
-        // Convert fee to ZUSD using NAV ratio (fee in zHYPE -> HYPE -> ZUSD)
-        if (fee > 0 && zusdNav > 0) {
-            uint256 feeInZusd = (fee * navBefore) / zusdNav;
-            accumulatedFees += feeInZusd;
-        }
-
-        // Stake HYPE through Kinetiq (sending actual HYPE)
-        uint256 kHYPEReceived = kinetiq.stakeHYPE{value: amountHYPE}(amountHYPE);
-        totalKHYPEBalance += kHYPEReceived;
-
-        // Immediately deposit kHYPE to vault for yield earning
+        // Deposit ALL kHYPE to vault, but only track net as collateral
         _depositKHYPEToVault(kHYPEReceived);
+        totalKHYPEBalance += netKHYPE;
 
         // Mint zHYPE to user
         zhype.mint(msg.sender, zhypeMinted);
-        
+
         // Update user position - only track collateral and timestamp
         userPositions[msg.sender].hypeCollateral += amountHYPE;
         userPositions[msg.sender].lastUpdateTime = block.timestamp;
-        
-        // Update total collateral
-        totalHYPECollateral += amountHYPE;
+
+        // Update total collateral using actual kHYPE value, not input HYPE
+        totalHYPECollateral += actualHypeValue;
 
         // Track total deposits for maximum limit enforcement
         totalHypeDeposited += amountHYPE;
-        emit DepositTracked(msg.sender, amountHYPE, totalHypeDeposited);
 
-        // Calculate USD value invested using the same price used for NAV
-        // Since NAV = 1/price for zUSD, we can derive: price = 1/zusdNav
-        uint256 usdValueInvested = (PRECISION * PRECISION) / zusdNav; // This gives us HYPE price in USD
-        usdValueInvested = (amountHYPE * usdValueInvested) / PRECISION;
+        // Calculate USD value invested using cached HYPE price
+        uint256 usdValueInvested = (amountHYPE * hypePrice) / PRECISION;
 
         emit LevercoinMinted(msg.sender, amountHYPE, zhypeMinted, usdValueInvested);
-        
+
         // Check and update system state
-        _updateSystemState();
-        
+        updateSystemState();
+
         return zhypeMinted;
     }
-    
+
     /**
-     * @notice Mint zUSD stablecoin by staking HYPE
-     * @param amountHYPE Amount of HYPE to stake
+     * @notice Mint zUSD stablecoin by staking or swapping HYPE to kHYPE
+     * @dev If swapData is empty, uses Kinetiq staking (no slippage, min 5 HYPE, dynamic fee)
+     *      If swapData is provided, uses DEX swap (flexible, slippage protected, fixed fee)
+     * @param amountHYPE Amount of HYPE to convert
+     * @param swapData Encoded swap data from KyberSwap API (empty for Kinetiq staking)
      * @return zusdMinted Amount of zUSD minted
      */
-    function mintStablecoin(uint256 amountHYPE) external payable nonReentrant whenNotPaused returns (uint256 zusdMinted) {
+    function mintStablecoin(uint256 amountHYPE, bytes calldata swapData) external payable nonReentrant whenNotPaused returns (uint256 zusdMinted) {
         if (msg.value != amountHYPE) revert IncorrectHYPEAmount();
 
         // Check our protocol minimum
         if (amountHYPE < minimumAmounts.mintHypeMin) revert BelowMinimumAmount();
-
-        // Also check Kinetiq minimum (if different)
-        uint256 kinetiqMin = kinetiq.getMinStakingAmount();
-        if (amountHYPE < kinetiqMin) {
-            revert MinimumStakingAmountNotMet(amountHYPE, kinetiqMin);
-        }
 
         // Check maximum total deposit limit
         uint256 newTotal = totalHypeDeposited + amountHYPE;
@@ -431,59 +457,63 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             revert MaximumDepositExceeded(newTotal, maxTotalDeposit);
         }
 
-        // Get HYPE price for USD value calculation
-        IOracle.PriceData memory hypePrice = oracle.getPrice("HYPE");
-        if (!oracle.isValidPrice(hypePrice)) revert OraclePriceInvalid();
+        // Get HYPE price from oracle
+        IOracle.PriceData memory priceData = oracle.getPrice("HYPE");
+        if (!oracle.isValidPrice(priceData)) revert OraclePriceInvalid();
+        uint256 hypePrice = priceData.price;
 
-        // Calculate zUSD amount (1 zUSD = $1)
-        zusdMinted = (amountHYPE * hypePrice.price) / PRECISION;
+        // Get fee basis points based on current CR
+        uint256 cr = _getSystemCRWithPrice(hypePrice);
+        uint256 feeBps = _getProtocolFeeWithCR(true, true, cr);  // hzUSD, mint
 
-        // Apply protocol fee based on CR
-        uint256 feeBps = getCurrentFee();
-        uint256 fee = (zusdMinted * feeBps) / BASIS_POINTS;
-        zusdMinted -= fee;
-        accumulatedFees += fee;
-        
-        // Stake HYPE through Kinetiq (sending actual HYPE)
-        uint256 kHYPEReceived = kinetiq.stakeHYPE{value: amountHYPE}(amountHYPE);
-        totalKHYPEBalance += kHYPEReceived;
+        // Stake ALL HYPE, then split kHYPE into fee + collateral
+        uint256 kHYPEReceived = _obtainKHYPE(amountHYPE, swapData);
+        uint256 feeKHYPE = (kHYPEReceived * feeBps) / BASIS_POINTS;
+        uint256 netKHYPE = kHYPEReceived - feeKHYPE;
+        accumulatedFees += feeKHYPE;
 
-        // Immediately deposit kHYPE to vault for yield earning
+        // Mint zUSD based on actual net kHYPE value (tied to execution, respects slippage)
+        uint256 exchangeRate = kinetiq.getExchangeRate();
+        uint256 actualHypeValue = (netKHYPE * exchangeRate) / PRECISION;
+        zusdMinted = (actualHypeValue * hypePrice) / PRECISION;
+
+        // Deposit ALL kHYPE to vault, but only track net as collateral
         _depositKHYPEToVault(kHYPEReceived);
+        totalKHYPEBalance += netKHYPE;
 
         // Mint zUSD to user
         zusd.mint(msg.sender, zusdMinted);
-        
+
         // Update user position - only track collateral and timestamp
         userPositions[msg.sender].hypeCollateral += amountHYPE;
         userPositions[msg.sender].lastUpdateTime = block.timestamp;
-        
-        // Update total collateral
-        totalHYPECollateral += amountHYPE;
+
+        // Update total collateral using actual kHYPE value, not input HYPE
+        totalHYPECollateral += actualHypeValue;
 
         // Track total deposits for maximum limit enforcement
         totalHypeDeposited += amountHYPE;
-        emit DepositTracked(msg.sender, amountHYPE, totalHypeDeposited);
 
-        // Calculate USD value invested (using existing hypePrice from line 413)
-        uint256 usdValueInvested = (amountHYPE * hypePrice.price) / PRECISION;
+        // Calculate USD value invested using cached HYPE price
+        uint256 usdValueInvested = (amountHYPE * hypePrice) / PRECISION;
 
         emit StablecoinMinted(msg.sender, amountHYPE, zusdMinted, usdValueInvested);
-        
+
         // Check and update system state
-        _updateSystemState();
-        
+        updateSystemState();
+
         return zusdMinted;
     }
-    
+
     // =====================
     // === SYSTEM MGMT =====
     // =====================
-    
+
     /**
      * @notice Update system state based on current CR
+     * @dev Public function - callable by anyone to refresh state
      */
-    function _updateSystemState() internal {
+    function updateSystemState() public {
         uint256 cr = getSystemCR();
         IHypeZionExchange.SystemState newState;
 
@@ -506,8 +536,6 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
                 emit EmergencyStateActivated(cr);
             }
         }
-
-        emit CollateralRatioUpdated(cr);
     }
 
     /**
@@ -546,146 +574,19 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     }
 
     /**
-     * @notice Calculate minimum output with slippage tolerance
-     * @param amount Input amount
-     * @param slippageBps Slippage tolerance in basis points (e.g., 50 = 0.5%)
-     * @return minOut Minimum acceptable output after slippage
-     * @dev Helper function for calculating slippage protection
+     * @notice Internal helper to obtain kHYPE via Kinetiq staking or DEX swap
+     * @dev If swapData is empty, uses Kinetiq staking (no slippage, min 5 HYPE)
+     *      If swapData is provided, uses DEX swap (flexible, slippage protected)
+     * @param hypeAmount Amount of HYPE to convert
+     * @param swapData Encoded swap data from KyberSwap API (empty for Kinetiq staking)
+     * @return kHYPEReceived Amount of kHYPE received
      */
-    function _calculateMinOut(uint256 amount, uint256 slippageBps) internal pure returns (uint256 minOut) {
-        if (slippageBps > BASIS_POINTS) revert InvalidSlippage();
-        minOut = (amount * (BASIS_POINTS - slippageBps)) / BASIS_POINTS;
-    }
-
-    /// @notice Internal swap for protocol interventions (bypasses critical state restrictions)
-    /// @dev Burns HzUSD from stability pool and mints hzHYPE to stability pool
-    /// @param zusdAmount Amount of HzUSD to convert from stability pool
-    /// @return zhypeAmount Amount of hzHYPE minted to stability pool
-    function _protocolInterventionSwap(uint256 zusdAmount)
-        internal
-        returns (uint256 zhypeAmount)
-    {
-        uint256 zhypeSupply = zhype.totalSupply();
-        uint256 zusdNav = getZusdNavInHYPE();
-
-        // If no zhype exists yet, mint at initial NAV maintaining value equivalence
-        if (zhypeSupply == 0) {
-            // @audit-fix: Must consider zusdNav to maintain value equivalence
-            // Value burned (in HYPE) = zusdAmount * zusdNav
-            // zhypeAmount = value_burned / INITIAL_ZHYPE_NAV
-            zhypeAmount = (zusdAmount * zusdNav) / INITIAL_ZHYPE_NAV;
+    function _obtainKHYPE(uint256 hypeAmount, bytes calldata swapData) internal returns (uint256 kHYPEReceived) {
+        if (swapData.length == 0) {
+            kHYPEReceived = kinetiq.stakeHYPE{value: hypeAmount}(hypeAmount);
         } else {
-            // Calculate zHYPE to mint maintaining value equivalence
-            // Formula: (zusdAmount * zusdNav * current_zhype_supply) / (PRECISION * current_zhype_equity)
-            uint256 current_liabilities_in_HYPE = getZusdLiabilitiesInHYPE();
-            uint256 current_reserves_in_HYPE = getTotalReserveInHYPE();
-            uint256 current_zhype_equity = current_reserves_in_HYPE - current_liabilities_in_HYPE;
-
-            // Value of minted zhype = value of burned zusd
-            // Convert zusdAmount tokens to HYPE value, then to zhype tokens
-            zhypeAmount = (zusdAmount * zusdNav * zhypeSupply) / (PRECISION * current_zhype_equity);
+            kHYPEReceived = dexIntegration.swapToKHype{value: hypeAmount}(swapData, 0);
         }
-
-        // Burn HzUSD from stability pool (decreases liability)
-        zusd.burn(address(stabilityPool), zusdAmount);
-
-        // Mint hzHYPE to stability pool (increases equity)
-        zhype.mint(address(stabilityPool), zhypeAmount);
-
-        emit ProtocolIntervention(zusdAmount, zhypeAmount, getSystemCR());
-    }
-
-    /**
-     * @notice Trigger protocol intervention to restore CR to 130%
-     * @dev Automatically calculates and converts HzUSD from stability pool to restore CR to 130%
-     * @dev Permissionless - anyone can call when CR < 130%
-     * @return zhypeMinted Amount of hzHYPE minted during intervention
-     */
-    function triggerIntervention()
-        external
-        returns (uint256 zhypeMinted)
-    {
-        uint256 cr = getSystemCR();
-
-        // Block intervention in Emergency state - would make things worse
-        if (systemState == IHypeZionExchange.SystemState.Emergency) {
-            revert EmergencyModeActive();
-        }
-
-        if (cr >= CAUTIOUS_CR_THRESHOLD) revert CRNotLowEnough();
-
-        // Calculate exact amount needed to restore CR to 130%
-        // Formula: current_liabilities_in_HYPE - current_reserves_in_HYPE/1.3
-        uint256 current_reserves_in_HYPE = getTotalReserveInHYPE();
-        uint256 current_liabilities_in_HYPE = getZusdLiabilitiesInHYPE();
-
-        // Liability reduction needed to reach 130% CR
-        uint256 liabilityReduction = current_liabilities_in_HYPE - (current_reserves_in_HYPE * BASIS_POINTS) / CAUTIOUS_CR_THRESHOLD;
-
-        // Convert liability reduction (in HYPE) to zusd tokens to burn
-        // zusdTokens = liabilityReduction / zusdNav
-        uint256 zusdNav = getZusdNavInHYPE();
-        uint256 zusdTokensToBurn = (liabilityReduction * PRECISION) / zusdNav;
-
-        // Validate amount doesn't exceed available assets in stability pool
-        uint256 availableForIntervention = zusd.balanceOf(address(stabilityPool));
-        if (zusdTokensToBurn > availableForIntervention) {
-            revert InsufficientInterventionAssets(zusdTokensToBurn, availableForIntervention);
-        }
-
-        // Perform internal swap: burn HzUSD tokens, mint hzHYPE
-        // This function also emits ProtocolIntervention event
-        zhypeMinted = _protocolInterventionSwap(zusdTokensToBurn);
-
-        // Update stability pool's internal accounting
-        stabilityPool.protocolIntervention(zusdTokensToBurn, zhypeMinted);
-
-        // Update system state after intervention
-        _updateSystemState();
-    }
-
-    /**
-     * @notice Exit recovery mode when CR becomes healthy (≥150%)
-     * @dev Converts hzHYPE back to hzUSD in stability pool, restoring single-asset state
-     * @dev Permissionless - anyone can call when CR ≥ 150% and pool has hzHYPE
-     * @param minZusdOut Minimum zUSD to mint (0 for no slippage protection)
-     */
-    function exitRecoveryMode(uint256 minZusdOut) external nonReentrant {
-        uint256 crBefore = getSystemCR();
-
-        if (crBefore < NORMAL_CR_THRESHOLD) {
-            revert CRNotLowEnough();
-        }
-
-        uint256 zhypeInPool = stabilityPool.hzhypeInPool();
-        if (zhypeInPool == 0) {
-            revert InvalidAmount(0);
-        }
-
-        // Calculate equivalent zUSD amount using current NAV values
-        // Formula: zusdAmount = zhypeInPool × zhypeNav / zusdNav
-        uint256 zhypeNav = getZhypeNavInHYPE();
-        uint256 zusdNav = getZusdNavInHYPE();
-
-        if (zusdNav == 0) revert InvalidNAV();
-
-        uint256 zusdToMint = (zhypeInPool * zhypeNav) / zusdNav;
-
-        if (minZusdOut > 0 && zusdToMint < minZusdOut) {
-            revert InsufficientBalance(zusdToMint, minZusdOut);
-        }
-
-        zhype.burn(address(stabilityPool), zhypeInPool);
-        zusd.mint(address(stabilityPool), zusdToMint);
-        stabilityPool.exitRecoveryMode(zhypeInPool, zusdToMint);
-        _updateSystemState();
-
-        uint256 crAfter = getSystemCR();
-        if (crAfter < NORMAL_CR_THRESHOLD) {
-            revert CRDroppedBelowThreshold(crAfter, NORMAL_CR_THRESHOLD);
-        }
-
-        emit RecoveryModeExited(zhypeInPool, zusdToMint, zhypeNav, zusdNav, crAfter);
     }
 
     // =====================
@@ -718,9 +619,6 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
      * @return redemptionId ID of the redemption request
      */
     function _executeRedeem(uint256 tokenAmount, bool isZusd) private returns (uint256 redemptionId) {
-        // NEW: Settle yield before redemption to ensure accurate NAV
-        _settleYieldIfNeeded();
-
         // Check minimum amount based on token type
         if (isZusd) {
             if (tokenAmount < minimumAmounts.redeemZusdMin) revert BelowMinimumAmount();
@@ -735,24 +633,13 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         // Get token NAV
         uint256 tokenNav = isZusd ? getZusdNavInHYPE() : getZhypeNavInHYPE();
 
-        // Calculate HYPE amount to return
-        uint256 hypeAmount = (tokenAmount * tokenNav) / PRECISION;
+        // Calculate gross HYPE amount and fee
+        uint256 grossHypeAmount = (tokenAmount * tokenNav) / PRECISION;
+        uint256 feeBps = getProtocolFee(isZusd, false);  // false = redeem
+        uint256 feeInHype = (grossHypeAmount * feeBps) / BASIS_POINTS;
+        uint256 hypeAmount = grossHypeAmount - feeInHype;
 
-        // Apply redemption fee
-        uint256 feeBps = getCurrentFee();
-        uint256 fee = (hypeAmount * feeBps) / BASIS_POINTS;
-        hypeAmount -= fee;
-
-        // Convert fee to ZUSD (fee in HYPE -> ZUSD)
-        if (fee > 0) {
-            uint256 zusdNav = getZusdNavInHYPE();
-            if (zusdNav > 0) {
-                uint256 feeInZusd = (fee * PRECISION) / zusdNav;
-                accumulatedFees += feeInZusd;
-            }
-        }
-
-        // Check reserves (different logic for zUSD vs zHYPE)
+        // Check reserves using net amount (what user gets)
         if (isZusd) {
             uint256 availableReserves = getAvailableReserveInHYPE();
             uint256 zusdLiabilities = getZusdLiabilitiesInHYPE();
@@ -767,9 +654,14 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             }
         }
 
-        // Calculate kHYPE amount needed
+        // Calculate kHYPE amounts: gross, fee (stays in vault), net (unstaked for user)
         uint256 exchangeRate = kinetiq.getExchangeRate();
-        uint256 khypeAmount = (hypeAmount * PRECISION) / exchangeRate;
+        uint256 grossKHYPE = (grossHypeAmount * PRECISION) / exchangeRate;
+        uint256 feeKHYPE = (grossKHYPE * feeBps) / BASIS_POINTS;
+        uint256 netKHYPE = grossKHYPE - feeKHYPE;
+
+        // Collect fee immediately — fee kHYPE stays in vault as protocol revenue
+        accumulatedFees += feeKHYPE;
 
         // Lock tokens from user BEFORE external calls (Checks-Effects-Interactions pattern)
         if (isZusd) {
@@ -778,23 +670,37 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             zhype.transferFrom(msg.sender, address(this), tokenAmount);
         }
 
-        // Withdraw kHYPE from Vault and transfer to Kinetiq
-        _withdrawKHYPEFromVault(khypeAmount);
+        // Withdraw only NET kHYPE from vault (fee kHYPE stays) and transfer to Kinetiq
+        _withdrawKHYPEFromVault(netKHYPE);
         address khypeToken = kinetiq.getKHypeAddress();
-        IERC20(khypeToken).safeTransfer(address(kinetiq), khypeAmount);
+        IERC20(khypeToken).safeTransfer(address(kinetiq), netKHYPE);
 
-        // Queue unstaking from Kinetiq
-        uint256 kinetiqWithdrawalId = kinetiq.queueUnstakeHYPE(khypeAmount);
+        // Queue unstaking from Kinetiq (only net amount)
+        uint256 kinetiqWithdrawalId = kinetiq.queueUnstakeHYPE(netKHYPE);
 
-        // Move kHYPE from available to locked
-        totalKHYPEBalance -= khypeAmount;
-        lockedKHYPEBalance += khypeAmount;
+        // Reduce cost basis proportionally: remove X% of kHYPE → remove X% of cost basis.
+        //
+        // Why? totalHYPECollateral is "cost basis" for yield calculation:
+        //   yield = vaultValue - totalHYPECollateral
+        //
+        // Use grossKHYPE for cost basis since both net (going to user) and fee (reclassified)
+        // are leaving the collateral pool.
+        uint256 costBasis = totalKHYPEBalance > 0
+            ? (grossKHYPE * totalHYPECollateral) / totalKHYPEBalance
+            : 0;
 
-        // Queue withdrawal
+        // Remove gross from collateral tracking, lock net for pending unstake
+        totalKHYPEBalance -= grossKHYPE;
+        lockedKHYPEBalance += netKHYPE;
+
+        // Reduce collateral using proportional cost basis
+        _reduceCollateral(costBasis);
+
+        // Queue withdrawal (fee already collected — no deferral needed)
         redemptionId = withdrawals.queueWithdrawal(
             msg.sender,
             tokenAmount,
-            khypeAmount,
+            netKHYPE,
             hypeAmount,
             kinetiqWithdrawalId,
             isZusd,
@@ -812,7 +718,7 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         emit RedemptionQueued(msg.sender, redemptionId, tokenAmount, hypeAmount, isZusd, usdValueRedeemed);
 
         // Update system state
-        _updateSystemState();
+        updateSystemState();
 
         return redemptionId;
     }
@@ -842,6 +748,8 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         // Remove kHYPE from locked balance (was moved to locked when queued)
         lockedKHYPEBalance -= request.khypeAmount;
 
+        // Fee was already collected as kHYPE at redeem time — no withholding needed
+
         // NOW burn the locked tokens (after successfully receiving HYPE)
         if (request.isZusd) {
             // Burn zUSD that was locked in contract
@@ -851,20 +759,15 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             zhype.burn(address(this), request.tokenAmount);
         }
 
-        // Transfer HYPE to user
+        // Transfer all HYPE to user
         (bool success, ) = payable(msg.sender).call{value: hypeReceived}("");
         if (!success) revert HYPETransferFailed();
 
         // Update user position and totals
         userPositions[msg.sender].lastUpdateTime = block.timestamp;
 
-        // Use saturating subtraction to prevent accounting drift
-        totalHYPECollateral = totalHYPECollateral >= hypeReceived ?
-            totalHYPECollateral - hypeReceived : 0;
-
-        // Decrease total deposits to allow new deposits after redemptions
-        totalHypeDeposited = totalHypeDeposited >= hypeReceived ?
-            totalHypeDeposited - hypeReceived : 0;
+        // Note: totalHYPECollateral and totalHypeDeposited were already reduced
+        // at queue time in _executeRedeem (when kHYPE left the vault).
 
         // Mark withdrawal as claimed using library
         withdrawals.markWithdrawalClaimed(redemptionId, hypeReceived);
@@ -877,7 +780,7 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         emit RedemptionClaimed(msg.sender, redemptionId, hypeReceived, usdValueClaimed);
 
         // Update system state
-        _updateSystemState();
+        updateSystemState();
 
         return hypeReceived;
     }
@@ -968,11 +871,19 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         uint256 exchangeRate = kinetiq.getExchangeRate();
         uint256 khypeNeeded = (hypeEquivalent * PRECISION) / exchangeRate;
 
-        // Check we have enough kHYPE
+        // Calculate fee in kHYPE — fee stays in vault as protocol revenue
+        uint256 feeBps = getProtocolFee(isZusd, false);  // false = redeem
+        uint256 feeKHYPE = (khypeNeeded * feeBps) / BASIS_POINTS;
+        uint256 netKHYPE = khypeNeeded - feeKHYPE;
+
+        // Check we have enough kHYPE (collateral must cover gross amount)
         if (khypeNeeded > totalKHYPEBalance) revert InsufficientReserves(khypeNeeded, totalKHYPEBalance);
 
-        // Check rate divergence (Kinetiq vs DEX)
-        _checkRateDivergence(khypeNeeded, minHypeOut, exchangeRate);
+        // Check rate divergence (Kinetiq vs DEX) — use net kHYPE for divergence check
+        _checkRateDivergence(netKHYPE, minHypeOut, exchangeRate);
+
+        // Collect fee immediately — fee kHYPE stays in vault
+        accumulatedFees += feeKHYPE;
 
         // Burn tokens from user
         if (isZusd) {
@@ -983,42 +894,38 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
 
         address khypeToken = kinetiq.getKHypeAddress();
 
-        _withdrawKHYPEFromVault(khypeNeeded);
+        // Withdraw only net kHYPE from vault (fee kHYPE stays)
+        _withdrawKHYPEFromVault(netKHYPE);
 
-        IERC20(khypeToken).safeTransfer(address(dexIntegration), khypeNeeded);
+        IERC20(khypeToken).safeTransfer(address(dexIntegration), netKHYPE);
 
         uint256 hypeSwapped = dexIntegration.executeSwap(
             encodedSwapData,
             khypeToken,
             NATIVE_HYPE,
-            khypeNeeded,
+            netKHYPE,
             minHypeOut,
             address(this)
         );
 
         if (hypeSwapped < minHypeOut) revert InsufficientOutput(hypeSwapped, minHypeOut);
 
-        uint256 fee = (hypeSwapped * swapRedeemFeeBps) / BASIS_POINTS;
         IOracle.PriceData memory hypePrice = oracle.getPrice("HYPE");
         if (!oracle.isValidPrice(hypePrice)) revert OraclePriceInvalid();
 
-        accumulatedFees += (fee * hypePrice.price) / PRECISION;
-        uint256 netHype = hypeSwapped - fee;
+        // Proportional cost basis - see _executeRedeem for detailed explanation.
+        // Use gross kHYPE: both net (swapped) and fee (reclassified) leave the collateral pool.
+        uint256 costBasis = totalKHYPEBalance > 0
+            ? (khypeNeeded * totalHYPECollateral) / totalKHYPEBalance
+            : 0;
 
         totalKHYPEBalance -= khypeNeeded;
 
-        // Reduce totalHYPECollateral to reflect withdrawn collateral
-        // Use saturating subtraction to prevent accounting drift
-        totalHYPECollateral = totalHYPECollateral >= hypeEquivalent ?
-            totalHYPECollateral - hypeEquivalent : 0;
+        // Reduce collateral using proportional cost basis
+        _reduceCollateral(costBasis);
 
-        // Decrease total deposits to allow new deposits after redemptions
-        totalHypeDeposited = totalHypeDeposited >= hypeEquivalent ?
-            totalHypeDeposited - hypeEquivalent : 0;
-
-        // Transfer net HYPE to user (native transfer)
-        // Note: We keep the fee in HYPE in the contract as protocol revenue
-        (bool success, ) = payable(msg.sender).call{value: netHype}("");
+        // Transfer all HYPE to user (fee already collected as kHYPE)
+        (bool success, ) = payable(msg.sender).call{value: hypeSwapped}("");
         if (!success) revert HYPETransferFailed();
 
         userPositions[msg.sender].lastUpdateTime = block.timestamp;
@@ -1027,63 +934,16 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
             msg.sender,
             isZusd ? 0 : 1,
             tokenAmount,
-            khypeNeeded,
-            netHype,
-            fee,
+            netKHYPE,
+            hypeSwapped,
+            feeKHYPE,
             (hypeEquivalent * hypePrice.price) / PRECISION
         );
 
         // Update system state
-        _updateSystemState();
+        updateSystemState();
 
-        return netHype;
-    }
-
-    /**
-     * @notice Get quote for SwapRedeem operation
-     * @dev Estimates HYPE output for a given token amount without executing the swap
-     * @param tokenAmount Amount of zUSD or zHYPE to redeem
-     * @param isZusd True for zUSD, false for zHYPE
-     * @param expectedHypeFromDex Expected HYPE from DEX (from frontend API call)
-     * @return khypeNeeded Amount of kHYPE needed for swap
-     * @return grossHype Gross HYPE before fee
-     * @return fee SwapRedeem fee amount
-     * @return netHype Net HYPE user will receive
-     * @return usdValue USD value of redemption
-     */
-    function getSwapRedeemQuote(
-        uint256 tokenAmount,
-        bool isZusd,
-        uint256 expectedHypeFromDex
-    ) external view returns (
-        uint256 khypeNeeded,
-        uint256 grossHype,
-        uint256 fee,
-        uint256 netHype,
-        uint256 usdValue
-    ) {
-        // Get token NAV
-        uint256 tokenNav = isZusd ? getZusdNavInHYPE() : getZhypeNavInHYPE();
-
-        // Calculate kHYPE needed
-        uint256 hypeEquivalent = (tokenAmount * tokenNav) / PRECISION;
-        uint256 exchangeRate = kinetiq.getExchangeRate();
-        khypeNeeded = (hypeEquivalent * PRECISION) / exchangeRate;
-
-        // Gross HYPE from DEX (provided by caller from API)
-        grossHype = expectedHypeFromDex;
-
-        // Calculate fee
-        fee = (grossHype * swapRedeemFeeBps) / BASIS_POINTS;
-        netHype = grossHype - fee;
-
-        // Calculate USD value
-        IOracle.PriceData memory hypePrice = oracle.getPrice("HYPE");
-        if (hypePrice.price > 0) {
-            usdValue = (hypeEquivalent * hypePrice.price) / PRECISION;
-        }
-
-        return (khypeNeeded, grossHype, fee, netHype, usdValue);
+        return hypeSwapped;
     }
 
     /**
@@ -1125,18 +985,23 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
     // =====================
     // === ADMIN FUNCTIONS =
     // =====================
-    
+
     /**
-     * @notice Collect accumulated fees (owner only)
+     * @notice Collect accumulated fees and send to specified recipient
+     * @param recipient Address to receive the collected kHYPE fees
      */
-    function collectFees() external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function collectFees(address recipient) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (recipient == address(0)) revert InvalidAddress();
         uint256 fees = accumulatedFees;
+        if (fees == 0) revert AmountMustBeGreaterThanZero();
         accumulatedFees = 0;
 
-        // Mint fee amount as zUSD to owner
-        zusd.mint(msg.sender, fees);
+        // Withdraw fee kHYPE from vault and send to recipient
+        _withdrawKHYPEFromVault(fees);
+        address khypeToken = kinetiq.getKHypeAddress();
+        IERC20(khypeToken).safeTransfer(recipient, fees);
 
-        emit FeesCollected(msg.sender, fees);
+        emit FeesCollected(recipient, fees);
     }
 
     /**
@@ -1147,100 +1012,18 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         protocolVersion = version;
     }
 
-
-    /**
-     * @notice Fund reserves with HYPE to improve system health
-     * @dev Owner-only function to directly inject HYPE into reserves
-     *      This helps bootstrap the system or recover from Critical state
-     *      The HYPE is staked through Kinetiq to earn yield
-     *      Note: Does not mint tokens - purely adds to reserves
-     * @param amountHYPE Amount of HYPE to add to reserves
-     */
-    function fundReserves(uint256 amountHYPE) external payable onlyRole(DEFAULT_ADMIN_ROLE) nonReentrant {
-        if (msg.value != amountHYPE) revert IncorrectHYPEAmount();
-
-        // Stake HYPE through Kinetiq to earn yield
-        uint256 kHYPEReceived = kinetiq.stakeHYPE{value: amountHYPE}(amountHYPE);
-
-        // Update protocol balances
-        totalHYPECollateral += amountHYPE;
-        totalKHYPEBalance += kHYPEReceived;
-
-        // Immediately deposit kHYPE to vault for yield earning
-        _depositKHYPEToVault(kHYPEReceived);
-
-        // Get updated metrics
-        uint256 newTotalReserves = getTotalReserveInHYPE();
-        uint256 newCR = getSystemCR();
-
-        // Update system state if CR improved
-        _updateSystemState();
-
-        emit ReservesFunded(msg.sender, amountHYPE, newTotalReserves, newCR);
-    }
-
     /**
      * @notice Settle pending yield if available before redemption
      * @dev Called internally before redemptions to ensure NAV is current
      * @return yieldSettled Amount of yield that was settled (in HYPE)
      */
-    function _settleYieldIfNeeded() internal returns (uint256 yieldSettled) {
-        // Get yield manager address
-        address yieldManagerAddr = kinetiq.getYieldManager();
-        if (yieldManagerAddr == address(0)) {
-            return 0; // No yield manager configured
-        }
-
-        // Cast to KinetiqYieldManager interface (using same ABI as we'll check)
-        // We'll use low-level calls to avoid interface import issues
-
-        // Check if there's harvestable yield
-        (bool success1, bytes memory data1) = yieldManagerAddr.staticcall(
-            abi.encodeWithSignature("calculateYield()")
-        );
-        if (!success1) return 0;
-        uint256 pendingYield = abi.decode(data1, (uint256));
-
-        // Only settle if yield meets minimum threshold (avoid gas waste on tiny amounts)
-        if (pendingYield < MIN_YIELD_TO_SETTLE) {
-            return 0;
-        }
-
-        // Check if harvest cooldown allows settling now
-        (bool success2, bytes memory data2) = yieldManagerAddr.staticcall(
-            abi.encodeWithSignature("canHarvest()")
-        );
-        if (!success2) return 0;
-        (bool canHarvest, ) = abi.decode(data2, (bool, uint256));
-        if (!canHarvest) {
-            return 0; // Cooldown active, skip settling
-        }
-
-        // Queue yield withdrawal
-        (bool success3, bytes memory data3) = yieldManagerAddr.call(
-            abi.encodeWithSignature("queueYieldWithdrawal()")
-        );
-        if (!success3) {
-            // Yield settlement failed (e.g., amount too small after queue)
-            // Continue with redemption using current NAV
-            return 0;
-        }
-
-        uint256 withdrawalId = abi.decode(data3, (uint256));
-
-        // Yield queued successfully, but not yet claimable
-        // Future redemptions will benefit from the updated NAV once claimed
-        emit YieldSettlementQueued(withdrawalId, pendingYield);
-        return pendingYield;
-    }
-
     /**
      * @notice Pause protocol (owner only)
      */
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
-    
+
     /**
      * @notice Unpause protocol (owner only)
      */
@@ -1313,11 +1096,17 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         return actualReceived;
     }
 
-    /// @notice Withdraw kHYPE from vault for yield (YieldManager only)
-    function withdrawKHYPEForYield(uint256 k) external {
-        require(msg.sender == address(kinetiq.getYieldManager()));
-        _withdrawKHYPEFromVault(k);
-        IERC20(kinetiq.getKHypeAddress()).safeTransfer(address(kinetiq), k);
+    /**
+     * @notice Withdraw kHYPE for yield harvesting - updates accounting to prevent NAV inflation
+     * @dev Only callable by YieldManager. Transfers kHYPE to caller (YieldManager) for DEX swap.
+     * @param kHypeAmount Amount of kHYPE to withdraw
+     */
+    function withdrawKHYPEForYield(uint256 kHypeAmount) external {
+        require(msg.sender == address(kinetiq.getYieldManager()), "Only YieldManager");
+        _withdrawKHYPEFromVault(kHypeAmount);
+        totalKHYPEBalance -= kHypeAmount;
+        // Transfer to YieldManager (caller) instead of Kinetiq - for DEX-based yield flow
+        IERC20(kinetiq.getKHypeAddress()).safeTransfer(msg.sender, kHypeAmount);
     }
 
 
@@ -1327,6 +1116,14 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
      * @param newImplementation Address of new implementation contract
      */
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
+
+    /**
+     * @dev Saturating subtraction of hypeAmount from totalHYPECollateral and totalHypeDeposited.
+     */
+    function _reduceCollateral(uint256 hypeAmount) internal {
+        totalHYPECollateral = totalHYPECollateral >= hypeAmount ? totalHYPECollateral - hypeAmount : 0;
+        totalHypeDeposited = totalHypeDeposited >= hypeAmount ? totalHypeDeposited - hypeAmount : 0;
+    }
 
     // ==============================
     // === MINIMUM CONFIG MGMT ======
@@ -1373,43 +1170,93 @@ contract HypeZionExchange is IHypeZionExchange, AccessControlUpgradeable, Reentr
         emit MaximumLimitsUpdated(_maxTotalDeposit);
     }
 
+    // ================================
+    // === INTERVENTION FUNCTIONS =====
+    // ================================
+
+    /// @notice Set the InterventionManager address
+    function setInterventionManager(address _im) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_im == address(0)) revert InvalidAddress();
+        emit InterventionManagerUpdated(interventionManager, _im);
+        interventionManager = _im;
+    }
+
+    /// @notice Burn tokens for intervention (only InterventionManager)
+    function interventionBurn(address from, uint256 amount, bool isZusd) external {
+        if (msg.sender != interventionManager) revert UnauthorizedAccess();
+        if (isZusd) zusd.burn(from, amount);
+        else zhype.burn(from, amount);
+    }
+
+    /// @notice Mint tokens for intervention (only InterventionManager)
+    function interventionMint(address to, uint256 amount, bool isZusd) external {
+        if (msg.sender != interventionManager) revert UnauthorizedAccess();
+        if (isZusd) zusd.mint(to, amount);
+        else zhype.mint(to, amount);
+    }
+
+    // ========================
+    // === V3 FEE SETTERS =====
+    // ========================
+
     /**
-     * @notice Set protocol fee configuration (basis points)
-     * @param _feeHealthy Fee when CR >= 150% (e.g., 30 = 0.3%)
-     * @param _feeCautious Fee when 130% <= CR < 150% (e.g., 20 = 0.2%)
-     * @param _feeCritical Fee when CR < 130% (e.g., 10 = 0.1%)
+     * @notice Set token-specific fee configuration for both bullHYPE and hzUSD
+     * @param bullHypeMintFees bullHYPE mint fees [healthy, cautious, critical] in basis points
+     * @param bullHypeRedeemFees bullHYPE redeem fees [healthy, cautious, critical] in basis points
+     * @param hzUsdMintFees hzUSD mint fees [healthy, cautious, critical] in basis points
+     * @param hzUsdRedeemFees hzUSD redeem fees [healthy, cautious, critical] in basis points
      */
-    function setProtocolFees(
-        uint256 _feeHealthy,
-        uint256 _feeCautious,
-        uint256 _feeCritical
+    function setTokenFees(
+        uint16[3] calldata bullHypeMintFees,
+        uint16[3] calldata bullHypeRedeemFees,
+        uint16[3] calldata hzUsdMintFees,
+        uint16[3] calldata hzUsdRedeemFees
     ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_feeHealthy > 1000) revert FeeTooHigh(); // Max 10%
-        if (_feeCautious > 1000) revert FeeTooHigh();
-        if (_feeCritical > 1000) revert FeeTooHigh();
+        // bullHYPE: Mint max 10%, Redeem max 15%
+        if (bullHypeMintFees[0] > 1000 || bullHypeMintFees[1] > 1000 || bullHypeMintFees[2] > 1000) revert FeeTooHigh();
+        if (bullHypeRedeemFees[0] > 1500 || bullHypeRedeemFees[1] > 1500 || bullHypeRedeemFees[2] > 1500) revert FeeTooHigh();
+        // hzUSD: Mint and redeem max 10%
+        if (hzUsdMintFees[0] > 1000 || hzUsdMintFees[1] > 1000 || hzUsdMintFees[2] > 1000) revert FeeTooHigh();
+        if (hzUsdRedeemFees[0] > 1000 || hzUsdRedeemFees[1] > 1000 || hzUsdRedeemFees[2] > 1000) revert FeeTooHigh();
 
-        feeHealthy = _feeHealthy;
-        feeCautious = _feeCautious;
-        feeCritical = _feeCritical;
+        _bullHYPEFees = IHypeZionExchange.TokenFees({
+            mintHealthy: bullHypeMintFees[0],
+            mintCautious: bullHypeMintFees[1],
+            mintCritical: bullHypeMintFees[2],
+            redeemHealthy: bullHypeRedeemFees[0],
+            redeemCautious: bullHypeRedeemFees[1],
+            redeemCritical: bullHypeRedeemFees[2]
+        });
 
-        emit ProtocolFeeUpdated(_feeHealthy, _feeCautious, _feeCritical);
+        _hzUSDFees = IHypeZionExchange.TokenFees({
+            mintHealthy: hzUsdMintFees[0],
+            mintCautious: hzUsdMintFees[1],
+            mintCritical: hzUsdMintFees[2],
+            redeemHealthy: hzUsdRedeemFees[0],
+            redeemCautious: hzUsdRedeemFees[1],
+            redeemCritical: hzUsdRedeemFees[2]
+        });
+
+        emit TokenFeesUpdated(bullHypeMintFees, bullHypeRedeemFees, hzUsdMintFees, hzUsdRedeemFees);
+    }
+
+    // ========================
+    // === V3 FEE GETTERS =====
+    // ========================
+
+    /**
+     * @notice Get bullHYPE fee configuration
+     * @return TokenFees struct with all fee values
+     */
+    function bullHYPEFees() external view returns (IHypeZionExchange.TokenFees memory) {
+        return _bullHYPEFees;
     }
 
     /**
-     * @notice Set swap redeem configuration
-     * @param _swapRedeemFeeBps Fee for swap redeem operations in basis points (e.g., 500 = 5%)
-     * @param _maxRateDivergenceBps Maximum allowed rate divergence in basis points (e.g., 1000 = 10%)
+     * @notice Get hzUSD fee configuration
+     * @return TokenFees struct with all fee values
      */
-    function setSwapRedeemConfig(
-        uint256 _swapRedeemFeeBps,
-        uint256 _maxRateDivergenceBps
-    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_swapRedeemFeeBps > 2000) revert FeeTooHigh(); // Max 20%
-        if (_maxRateDivergenceBps > 5000) revert RateDivergenceTooHigh(_maxRateDivergenceBps, 5000); // Max 50%
-
-        swapRedeemFeeBps = _swapRedeemFeeBps;
-        maxRateDivergenceBps = _maxRateDivergenceBps;
-
-        emit SwapRedeemConfigUpdated(_swapRedeemFeeBps, _maxRateDivergenceBps);
+    function hzUSDFees() external view returns (IHypeZionExchange.TokenFees memory) {
+        return _hzUSDFees;
     }
 }

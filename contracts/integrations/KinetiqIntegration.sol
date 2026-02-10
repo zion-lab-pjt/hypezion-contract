@@ -124,7 +124,11 @@ contract KinetiqIntegration is
 
     /**
      * @notice Stake HYPE to receive kHYPE
-     * @dev Follows CEI pattern: Checks-Effects-Interactions
+     * @dev Uses modified CEI: stake() interaction must precede state update because we need
+     *      the actual kHYPE received (balance diff). Reentrancy is prevented by nonReentrant
+     *      + kinetiqOperationLock modifiers. Only safeTransfer occurs after state update.
+     * @dev DEPRECATED: Use KyberSwapDexIntegration.swapToKHype() instead for better gas efficiency.
+     *      This function is kept for backward compatibility and will be removed in future versions.
      * @param amount Amount of HYPE to stake
      * @return kHYPEReceived Amount of kHYPE tokens received
      */
@@ -135,33 +139,30 @@ contract KinetiqIntegration is
         }
         require(msg.value == amount, "Incorrect HYPE amount");
 
-        // Calculate expected kHYPE based on current exchange rate
+        // Calculate expected kHYPE based on current exchange rate (for sanity check)
         uint256 exchangeRate = IStakingAccountant(STAKING_ACCOUNTANT).HYPEToKHYPE(1e18);
-        kHYPEReceived = (amount * exchangeRate) / 1e18;
+        uint256 expectedKHYPE = (amount * exchangeRate) / 1e18;
 
-        // EFFECTS: Update state before external calls
-        stakedAmounts[hypeNovaExchange] += kHYPEReceived;
-
-        // INTERACTIONS: External calls last
-        // Store balance before for verification
+        // INTERACTION (trusted): Stake HYPE with Kinetiq and measure actual kHYPE received
+        // Note: This interaction precedes state update intentionally - we need the actual
+        // received amount. Reentrancy is blocked by nonReentrant + kinetiqOperationLock.
         uint256 kHYPEBefore = IERC20(KHYPE_TOKEN).balanceOf(address(this));
-
-        // Stake HYPE with Kinetiq (using constant address)
         IStakingManager(STAKING_MANAGER).stake{value: amount}();
-
-        // Verify the kHYPE was received (with small tolerance for rounding)
         uint256 kHYPEAfter = IERC20(KHYPE_TOKEN).balanceOf(address(this));
-        uint256 actualReceived = kHYPEAfter - kHYPEBefore;
+        kHYPEReceived = kHYPEAfter - kHYPEBefore;
 
-        // Allow for small rounding differences (0.1% tolerance)
+        // Sanity check: actual should be within 0.1% of expected
         require(
-            actualReceived >= (kHYPEReceived * 999) / 1000 &&
-            actualReceived <= (kHYPEReceived * 1001) / 1000,
+            kHYPEReceived >= (expectedKHYPE * 999) / 1000 &&
+            kHYPEReceived <= (expectedKHYPE * 1001) / 1000,
             "kHYPE received amount mismatch"
         );
 
-        // ✅ NEW: Transfer kHYPE to Exchange (Exchange will then deposit to Vault)
-        IERC20(KHYPE_TOKEN).safeTransfer(hypeNovaExchange, kHYPEReceived);
+        // EFFECTS: Update state with actual received amount
+        stakedAmounts[hypeNovaExchange] += kHYPEReceived;
+
+        // INTERACTION: Transfer actual kHYPE received to Exchange (caller)
+        IERC20(KHYPE_TOKEN).safeTransfer(msg.sender, kHYPEReceived);
 
         emit HYPEStaked(amount, kHYPEReceived);
         return kHYPEReceived;
@@ -205,9 +206,9 @@ contract KinetiqIntegration is
         withdrawalKHYPEFees[withdrawalId] = kinetiqRequest.kHYPEFee;       // Actual fee
 
         // Note: stakedAmounts is NOT reduced here - it's reduced when claimed
-        // This matches the Exchange behavior where totalHYPECollateral is reduced on claim
-        // Even though kHYPE tokens are transferred to StakingManager immediately,
-        // we track the accounting reduction at claim time for consistency
+        // Note: Exchange.totalHYPECollateral IS reduced at queue time (_executeRedeem)
+        // because kHYPE leaves the vault immediately and no longer earns yield.
+        // KinetiqIntegration.stakedAmounts is reduced at claim time for its own tracking.
 
         emit WithdrawalQueued(withdrawalId, khypeAmount);
         return withdrawalId;
@@ -237,7 +238,8 @@ contract KinetiqIntegration is
 
         // EFFECTS: Update state before external calls
         // Reduce stakedAmounts when claiming (not when queuing)
-        // This matches Exchange behavior where totalHYPECollateral is reduced on claim
+        // Note: Exchange.totalHYPECollateral is reduced at queue time, but
+        // KinetiqIntegration.stakedAmounts is reduced here at claim time.
         // Subtract BOTH post-fee amount AND fee from stakedAmounts to prevent accounting drift
         uint256 kHYPEAmount = withdrawalKHYPEAmounts[withdrawalId];  // Post-fee amount
         uint256 kHYPEFee = withdrawalKHYPEFees[withdrawalId];         // Fee amount
