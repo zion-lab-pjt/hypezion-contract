@@ -10,6 +10,9 @@ import "../interfaces/IDexIntegration.sol";
 import "../interfaces/IHypeZionExchange.sol";
 import "../tokens/HzUSD.sol";
 import "../tokens/BullHYPE.sol";
+import "../interfaces/IHypeZionExchange.sol";
+import "../tokens/HzUSD.sol";
+import "../tokens/BullHYPE.sol";
 
 /**
  * @title KyberSwapDexIntegration
@@ -21,6 +24,11 @@ import "../tokens/BullHYPE.sol";
  * - Frontend passes encodedSwapData to this contract via HypeZionExchange
  * - Contract validates parameters and executes swap via low-level call
  * - No on-chain quoting needed (handled off-chain by KyberSwap API)
+ *
+ * External Token Support:
+ * - Supports swapping external tokens (USDC, USDT, etc.) to hzUSD/bullHYPE
+ * - Generic design: easily add new tokens via addSupportedExternalToken()
+ * - Each token can have its own swap fee
  *
  * External Token Support:
  * - Supports swapping external tokens (USDC, USDT, etc.) to hzUSD/bullHYPE
@@ -67,6 +75,28 @@ contract KyberSwapDexIntegration is
     event KHypeTokenUpdated(address oldToken, address newToken);
     event YieldManagerUpdated(address oldYieldManager, address newYieldManager);
 
+    // ==================== Events ====================
+
+    event ExternalTokenAdded(address indexed token, uint256 feeBps);
+    event ExternalTokenRemoved(address indexed token);
+    event ExternalTokenSwapped(
+        address indexed user,
+        address indexed tokenIn,
+        address indexed tokenOut,
+        uint256 amountIn,
+        uint256 amountOut
+    );
+    event SwapToKHypeExecuted(
+        address indexed user,
+        address indexed tokenIn,
+        uint256 amountIn,
+        uint256 kHypeReceived,
+        uint256 feeTaken
+    );
+    event SwapToKHypeFeeBpsUpdated(uint256 oldFeeBps, uint256 newFeeBps);
+    event KHypeTokenUpdated(address oldToken, address newToken);
+    event YieldManagerUpdated(address oldYieldManager, address newYieldManager);
+
     // ==================== Constants ====================
 
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
@@ -74,15 +104,21 @@ contract KyberSwapDexIntegration is
     uint256 public constant BASIS_POINTS = 10000;
 
     // Native token address used by KyberSwap
-    address public constant NATIVE_TOKEN = 0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
+    address public constant NATIVE_TOKEN =
+        0xEeeeeEeeeEeEeeEeEeEeeEEEeeeeEeeeeeeeEEeE;
 
     // kHYPE token address (Kinetiq staked HYPE) - mainnet default
-    address public constant KHYPE_TOKEN_DEFAULT = 0xfD739d4e423301CE9385c1fb8850539D657C296D;
+    address public constant KHYPE_TOKEN_DEFAULT =
+        0xfD739d4e423301CE9385c1fb8850539D657C296D;
+
+    // kHYPE token address (Kinetiq staked HYPE) - mainnet default
+    address public constant KHYPE_TOKEN_DEFAULT =
+        0xfD739d4e423301CE9385c1fb8850539D657C296D;
 
     // ==================== State Variables ====================
 
-    address public kyberswapRouter;  // MetaAggregationRouterV2 address
-    address public exchange;         // Authorized HypeZionExchange address
+    address public kyberswapRouter; // MetaAggregationRouterV2 address
+    address public exchange; // Authorized HypeZionExchange address
 
     // External token swap support (USDC, USDT, WHYPE, etc.)
     mapping(address => bool) public supportedExternalTokens; // Tokens that can be swapped to hzUSD/bullHYPE
@@ -112,7 +148,14 @@ contract KyberSwapDexIntegration is
     }
 
     modifier onlyAuthorized() {
-        if (msg.sender != exchange && msg.sender != yieldManager) revert UnauthorizedCaller(msg.sender);
+        if (msg.sender != exchange && msg.sender != yieldManager)
+            revert UnauthorizedCaller(msg.sender);
+        _;
+    }
+
+    modifier onlyAuthorized() {
+        if (msg.sender != exchange && msg.sender != yieldManager)
+            revert UnauthorizedCaller(msg.sender);
         _;
     }
 
@@ -139,11 +182,18 @@ contract KyberSwapDexIntegration is
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATOR_ROLE, msg.sender);
 
-        if (_kyberswapRouter == address(0)) revert InvalidRouter(_kyberswapRouter);
+        if (_kyberswapRouter == address(0))
+            revert InvalidRouter(_kyberswapRouter);
         // Exchange can be zero initially, will be set later via setExchange()
 
         kyberswapRouter = _kyberswapRouter;
         exchange = _exchange;
+
+        // Initialize swapToKHype fee (example: 500 = 5%)
+        swapToKHypeFeeBps = 0;
+
+        // Initialize kHypeToken to mainnet default (can be changed for testnet)
+        kHypeToken = KHYPE_TOKEN_DEFAULT;
 
         // Initialize swapToKHype fee (example: 500 = 5%)
         swapToKHypeFeeBps = 0;
@@ -160,8 +210,8 @@ contract KyberSwapDexIntegration is
     /**
      * @notice Execute a swap on KyberSwap using pre-encoded route data from API
      * @dev encodedSwapData must be obtained from KyberSwap API:
-     *      1. GET /api/v1/routes (tokenIn, tokenOut, amountIn) → routeSummary
-     *      2. POST /api/v1/route/build (routeSummary, sender=this, recipient, slippage) → encodedSwapData
+     *      1. GET /api/v1/routes (tokenIn, tokenOut, amountIn) to routeSummary
+     *      2. POST /api/v1/route/build (routeSummary, sender=this, recipient, slippage) to encodedSwapData
      *
      * @param encodedSwapData Complete ABI-encoded calldata from KyberSwap API (includes function selector)
      * @param tokenIn Address of input token (use NATIVE_TOKEN for native HYPE)
@@ -183,10 +233,42 @@ contract KyberSwapDexIntegration is
         payable
         override
         onlyAuthorized
+        onlyAuthorized
         nonReentrant
         returns (uint256 amountOut)
     {
-        return _executeSwapInternal(encodedSwapData, tokenIn, tokenOut, amountIn, minAmountOut, recipient);
+        return
+            _executeSwapInternal(
+                encodedSwapData,
+                tokenIn,
+                tokenOut,
+                amountIn,
+                minAmountOut,
+                recipient
+            );
+    }
+
+    /**
+     * @dev Internal swap execution logic
+     * Can be called by external token swap functions without onlyExchange restriction
+     */
+    function _executeSwapInternal(
+        bytes memory encodedSwapData,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        address recipient
+    ) internal returns (uint256 amountOut) {
+        return
+            _executeSwapInternal(
+                encodedSwapData,
+                tokenIn,
+                tokenOut,
+                amountIn,
+                minAmountOut,
+                recipient
+            );
     }
 
     /**
@@ -206,8 +288,10 @@ contract KyberSwapDexIntegration is
         if (tokenOut == address(0)) revert InvalidToken(tokenOut);
         if (amountIn == 0) revert InvalidAmount(amountIn);
         // Note: minAmountOut can be 0 when slippage protection is handled in encoded data
+        // Note: minAmountOut can be 0 when slippage protection is handled in encoded data
         if (recipient == address(0)) revert InvalidToken(recipient);
-        if (encodedSwapData.length == 0) revert SwapFailed("Empty encoded data");
+        if (encodedSwapData.length == 0)
+            revert SwapFailed("Empty encoded data");
 
         // 2. Get balances before swap
         uint256 balanceOutBefore;
@@ -228,14 +312,34 @@ contract KyberSwapDexIntegration is
             // Verify we have the tokens
             IERC20 tokenInContract = IERC20(tokenIn);
             uint256 balance = tokenInContract.balanceOf(address(this));
-            if (balance < amountIn) revert InsufficientBalance(balance, amountIn);
+            if (balance < amountIn)
+                revert InsufficientBalance(balance, amountIn);
 
             // GAS OPTIMIZATION: Use lazy infinite approval
             // Only approve if current allowance is insufficient (saves ~20k gas per subsequent swap)
             // Safe because: router is admin-controlled, contract doesn't hold tokens long-term
-            uint256 currentAllowance = tokenInContract.allowance(address(this), kyberswapRouter);
+            uint256 currentAllowance = tokenInContract.allowance(
+                address(this),
+                kyberswapRouter
+            );
             if (currentAllowance < amountIn) {
-                tokenInContract.forceApprove(kyberswapRouter, type(uint256).max);
+                tokenInContract.forceApprove(
+                    kyberswapRouter,
+                    type(uint256).max
+                );
+            }
+            // GAS OPTIMIZATION: Use lazy infinite approval
+            // Only approve if current allowance is insufficient (saves ~20k gas per subsequent swap)
+            // Safe because: router is admin-controlled, contract doesn't hold tokens long-term
+            uint256 currentAllowance = tokenInContract.allowance(
+                address(this),
+                kyberswapRouter
+            );
+            if (currentAllowance < amountIn) {
+                tokenInContract.forceApprove(
+                    kyberswapRouter,
+                    type(uint256).max
+                );
             }
         }
 
@@ -244,7 +348,9 @@ contract KyberSwapDexIntegration is
         // - Function selector (first 4 bytes) for swap(SwapExecutionParams)
         // - ABI-encoded SwapExecutionParams struct
         uint256 valueToSend = isNativeInput ? amountIn : 0;
-        (bool success, bytes memory result) = kyberswapRouter.call{value: valueToSend}(encodedSwapData);
+        (bool success, bytes memory result) = kyberswapRouter.call{
+            value: valueToSend
+        }(encodedSwapData);
 
         if (!success) {
             // Decode revert reason if available
@@ -284,13 +390,11 @@ contract KyberSwapDexIntegration is
         // This saves ~20k gas per swap after first approval is set
 
         // 8. Emit event
-        emit SwapExecuted(
-            tokenIn,
-            tokenOut,
-            amountIn,
-            amountOut,
-            recipient
-        );
+        // Note: Using persistent infinite approval (no clear needed)
+        // This saves ~20k gas per swap after first approval is set
+
+        // 8. Emit event
+        emit SwapExecuted(tokenIn, tokenOut, amountIn, amountOut, recipient);
 
         return amountOut;
     }
@@ -301,7 +405,12 @@ contract KyberSwapDexIntegration is
      * @notice Get the KyberSwap router address
      * @return router Address of MetaAggregationRouterV2
      */
-    function getRouterAddress() external view override returns (address router) {
+    function getRouterAddress()
+        external
+        view
+        override
+        returns (address router)
+    {
         return kyberswapRouter;
     }
 
@@ -352,12 +461,18 @@ contract KyberSwapDexIntegration is
             address(this) // Receive kHYPE to this contract first
         );
 
-        if (kHypeFromSwap == 0) revert SwapFailed("No kHYPE received from swap");
+        if (kHypeFromSwap == 0)
+            revert SwapFailed("No kHYPE received from swap");
 
         // 2. Determine fee based on input token
         bool isNativeInput = inputToken == NATIVE_TOKEN;
-        uint256 feeBps = isNativeInput ? swapToKHypeFeeBps :
-            (externalTokenSwapFees[inputToken] > 0 ? externalTokenSwapFees[inputToken] : swapToKHypeFeeBps);
+        uint256 feeBps = isNativeInput
+            ? swapToKHypeFeeBps
+            : (
+                externalTokenSwapFees[inputToken] > 0
+                    ? externalTokenSwapFees[inputToken]
+                    : swapToKHypeFeeBps
+            );
 
         // 3. Apply fee
         uint256 fee = (kHypeFromSwap * feeBps) / BASIS_POINTS;
@@ -401,14 +516,15 @@ contract KyberSwapDexIntegration is
     ) external payable onlyExchange returns (uint256 kHypeReceived) {
         if (msg.value == 0) revert InvalidAmount(msg.value);
 
-        return _swapToKHypeInternal(
-            NATIVE_TOKEN,
-            msg.value,
-            swapData,
-            minKHypeOut,
-            msg.sender, // Exchange receives kHYPE
-            tx.origin   // Original user (for event)
-        );
+        return
+            _swapToKHypeInternal(
+                NATIVE_TOKEN,
+                msg.value,
+                swapData,
+                minKHypeOut,
+                msg.sender, // Exchange receives kHYPE
+                tx.origin // Original user (for event)
+            );
     }
 
     /**
@@ -433,21 +549,27 @@ contract KyberSwapDexIntegration is
         if (isNativeInput) {
             if (msg.value != amount) revert InvalidAmount(msg.value);
         } else {
-            if (!supportedExternalTokens[inputToken]) revert InvalidToken(inputToken);
+            if (!supportedExternalTokens[inputToken])
+                revert InvalidToken(inputToken);
             if (amount == 0) revert InvalidAmount(amount);
             // Transfer external token from user to this contract
-            IERC20(inputToken).safeTransferFrom(msg.sender, address(this), amount);
+            IERC20(inputToken).safeTransferFrom(
+                msg.sender,
+                address(this),
+                amount
+            );
         }
 
         // 2. Use internal function for swap logic
-        return _swapToKHypeInternal(
-            inputToken,
-            amount,
-            swapData,
-            minKHypeOut,
-            msg.sender, // User receives kHYPE
-            msg.sender  // User is caller (for event)
-        );
+        return
+            _swapToKHypeInternal(
+                inputToken,
+                amount,
+                swapData,
+                minKHypeOut,
+                msg.sender, // User receives kHYPE
+                msg.sender // User is caller (for event)
+            );
     }
 
     // ==================== External Token Swap Functions ====================
@@ -466,7 +588,8 @@ contract KyberSwapDexIntegration is
         bytes calldata hypeToExternalSwapData,
         uint256 minExternalOut
     ) external payable nonReentrant returns (uint256 externalReceived) {
-        if (!supportedExternalTokens[externalToken]) revert InvalidToken(externalToken);
+        if (!supportedExternalTokens[externalToken])
+            revert InvalidToken(externalToken);
         if (msg.value == 0) revert InvalidAmount(msg.value);
 
         // Swap HYPE → external token via DEX
@@ -513,12 +636,17 @@ contract KyberSwapDexIntegration is
         uint256 minHypeOut
     ) external nonReentrant returns (uint256 hypeReceived) {
         // 1. Validate
-        if (!supportedExternalTokens[externalToken]) revert InvalidToken(externalToken);
+        if (!supportedExternalTokens[externalToken])
+            revert InvalidToken(externalToken);
         if (amount == 0) revert InvalidAmount(amount);
 
         // 2. Pull external token from msg.sender (caller)
         // User must approve this contract before calling
-        IERC20(externalToken).safeTransferFrom(msg.sender, address(this), amount);
+        IERC20(externalToken).safeTransferFrom(
+            msg.sender,
+            address(this),
+            amount
+        );
 
         // 3. Swap external token → HYPE via KyberSwap
         // IMPORTANT: Send HYPE directly to user!
@@ -528,7 +656,7 @@ contract KyberSwapDexIntegration is
             NATIVE_TOKEN,
             amount,
             minHypeOut,
-            msg.sender  // User receives HYPE directly
+            msg.sender // User receives HYPE directly
         );
 
         if (hypeReceived == 0) revert SwapFailed("No HYPE received");
@@ -536,7 +664,7 @@ contract KyberSwapDexIntegration is
         emit ExternalTokenSwapped(
             msg.sender,
             externalToken,
-            NATIVE_TOKEN,  // HYPE
+            NATIVE_TOKEN, // HYPE
             amount,
             hypeReceived
         );
@@ -544,14 +672,15 @@ contract KyberSwapDexIntegration is
         return hypeReceived;
     }
 
-
     // ==================== Admin Functions ====================
 
     /**
      * @notice Set the fee for swapToKHype function
      * @param feeBps Fee in basis points (e.g., 500 = 5%)
      */
-    function setSwapToKHypeFeeBps(uint256 feeBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setSwapToKHypeFeeBps(
+        uint256 feeBps
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (feeBps > 5000) revert InvalidAmount(feeBps); // Max 50%
         uint256 oldFeeBps = swapToKHypeFeeBps;
         swapToKHypeFeeBps = feeBps;
@@ -563,7 +692,10 @@ contract KyberSwapDexIntegration is
      * @param token External token address
      * @param feeBps Fee in basis points (e.g., 0 = no fee, 500 = 5%)
      */
-    function addSupportedExternalToken(address token, uint256 feeBps) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function addSupportedExternalToken(
+        address token,
+        uint256 feeBps
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (token == address(0)) revert InvalidToken(token);
         if (feeBps > 5000) revert InvalidAmount(feeBps); // Max 50%
 
@@ -586,7 +718,9 @@ contract KyberSwapDexIntegration is
      * @notice Remove a supported external token
      * @param token External token address
      */
-    function removeSupportedExternalToken(address token) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function removeSupportedExternalToken(
+        address token
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         supportedExternalTokens[token] = false;
         externalTokenSwapFees[token] = 0;
 
@@ -598,8 +732,80 @@ contract KyberSwapDexIntegration is
      * @param _hzUSD hzUSD token address
      * @param _bullHYPE bullHYPE token address
      */
-    function setTokenContracts(address _hzUSD, address _bullHYPE) external onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (_hzUSD == address(0) || _bullHYPE == address(0)) revert InvalidToken(address(0));
+    function setTokenContracts(
+        address _hzUSD,
+        address _bullHYPE
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_hzUSD == address(0) || _bullHYPE == address(0))
+            revert InvalidToken(address(0));
+        hzUSD = HzUSD(_hzUSD);
+        bullHYPE = BullHYPE(_bullHYPE);
+    }
+
+    /**
+     * @notice Set the fee for swapToKHype function
+     * @param feeBps Fee in basis points (e.g., 500 = 5%)
+     */
+    function setSwapToKHypeFeeBps(
+        uint256 feeBps
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (feeBps > 5000) revert InvalidAmount(feeBps); // Max 50%
+        uint256 oldFeeBps = swapToKHypeFeeBps;
+        swapToKHypeFeeBps = feeBps;
+        emit SwapToKHypeFeeBpsUpdated(oldFeeBps, feeBps);
+    }
+
+    /**
+     * @notice Add or update a supported external token
+     * @param token External token address
+     * @param feeBps Fee in basis points (e.g., 0 = no fee, 500 = 5%)
+     */
+    function addSupportedExternalToken(
+        address token,
+        uint256 feeBps
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (token == address(0)) revert InvalidToken(token);
+        if (feeBps > 5000) revert InvalidAmount(feeBps); // Max 50%
+
+        // Verify token is a contract (has code)
+        if (token.code.length == 0) revert InvalidToken(token);
+
+        // Verify token implements ERC20 interface by calling balanceOf
+        // This will revert if the contract doesn't have balanceOf function
+        try IERC20(token).balanceOf(address(this)) {} catch {
+            revert InvalidToken(token);
+        }
+
+        supportedExternalTokens[token] = true;
+        externalTokenSwapFees[token] = feeBps;
+
+        emit ExternalTokenAdded(token, feeBps);
+    }
+
+    /**
+     * @notice Remove a supported external token
+     * @param token External token address
+     */
+    function removeSupportedExternalToken(
+        address token
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        supportedExternalTokens[token] = false;
+        externalTokenSwapFees[token] = 0;
+
+        emit ExternalTokenRemoved(token);
+    }
+
+    /**
+     * @notice Set token contract addresses (hzUSD, bullHYPE)
+     * @param _hzUSD hzUSD token address
+     * @param _bullHYPE bullHYPE token address
+     */
+    function setTokenContracts(
+        address _hzUSD,
+        address _bullHYPE
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
+        if (_hzUSD == address(0) || _bullHYPE == address(0))
+            revert InvalidToken(address(0));
         hzUSD = HzUSD(_hzUSD);
         bullHYPE = BullHYPE(_bullHYPE);
     }
@@ -608,7 +814,9 @@ contract KyberSwapDexIntegration is
      * @notice Set the KyberSwap router address
      * @param _router MetaAggregationRouterV2 address
      */
-    function setRouter(address _router) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setRouter(
+        address _router
+    ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_router == address(0)) revert InvalidRouter(_router);
         address oldRouter = kyberswapRouter;
         kyberswapRouter = _router;
@@ -619,7 +827,9 @@ contract KyberSwapDexIntegration is
      * @notice Set the authorized Exchange address
      * @param _exchange Exchange contract address
      */
-    function setExchange(address _exchange) external override onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setExchange(
+        address _exchange
+    ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_exchange == address(0)) revert InvalidToken(_exchange);
         address oldExchange = exchange;
         exchange = _exchange;
@@ -631,7 +841,9 @@ contract KyberSwapDexIntegration is
      * @dev Allows changing from mainnet kHYPE to MockKHYPE for testnet
      * @param _kHypeToken kHYPE token address
      */
-    function setKHypeToken(address _kHypeToken) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setKHypeToken(
+        address _kHypeToken
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_kHypeToken == address(0)) revert InvalidToken(_kHypeToken);
         address oldToken = kHypeToken;
         kHypeToken = _kHypeToken;
@@ -643,7 +855,9 @@ contract KyberSwapDexIntegration is
      * @dev YieldManager can call executeSwap for kHYPE → HYPE swaps during yield harvesting
      * @param _yieldManager YieldManager contract address
      */
-    function setYieldManager(address _yieldManager) external onlyRole(DEFAULT_ADMIN_ROLE) {
+    function setYieldManager(
+        address _yieldManager
+    ) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (_yieldManager == address(0)) revert InvalidToken(_yieldManager);
         address oldYieldManager = yieldManager;
         yieldManager = _yieldManager;
@@ -655,11 +869,10 @@ contract KyberSwapDexIntegration is
      * @param token Token address
      * @param amount Amount to rescue
      */
-    function rescueFunds(address token, uint256 amount)
-        external
-        override
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {
+    function rescueFunds(
+        address token,
+        uint256 amount
+    ) external override onlyRole(DEFAULT_ADMIN_ROLE) {
         if (token == address(0)) {
             payable(msg.sender).transfer(amount);
         } else {
@@ -669,11 +882,9 @@ contract KyberSwapDexIntegration is
 
     // ==================== UUPS Upgrade ====================
 
-    function _authorizeUpgrade(address newImplementation)
-        internal
-        override
-        onlyRole(DEFAULT_ADMIN_ROLE)
-    {}
+    function _authorizeUpgrade(
+        address newImplementation
+    ) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 
     // ==================== Receive Function ====================
 

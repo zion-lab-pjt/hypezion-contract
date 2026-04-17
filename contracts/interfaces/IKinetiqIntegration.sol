@@ -7,12 +7,12 @@ interface IKinetiqIntegration {
     event UnstakeQueued(uint256 hypeAmount, uint256 withdrawalId, uint256 claimableAt);
     event UnstakeClaimed(uint256 withdrawalId, uint256 hypeReceived, address recipient);
     event NAVUpdated(uint256 newNAV);
-    
+
     // Custom errors
     error KinetiqUnavailable(string reason);
     error NAVBelowMinimum(uint256 currentNAV);
     error WithdrawalNotReady(uint256 withdrawalId);
-    
+
     // Staking operations
     function stakeHYPE(uint256 amount) external payable returns (uint256 kHYPEReceived);
 
@@ -21,7 +21,7 @@ interface IKinetiqIntegration {
     function claimUnstake(uint256 withdrawalId) external returns (uint256 hypeReceived);
     function isUnstakeReady(uint256 withdrawalId) external view returns (bool ready, uint256 hypeAmount);
     function getWithdrawalDelay() external view returns (uint256 delaySeconds);
-    
+
     // NAV management
     function getExchangeRate() external view returns (uint256);
     function getKHYPEBalance() external view returns (uint256);

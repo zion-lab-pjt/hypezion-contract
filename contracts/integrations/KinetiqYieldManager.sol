@@ -6,6 +6,7 @@ import "@openzeppelin/contracts-upgradeable/utils/ReentrancyGuardUpgradeable.sol
 import "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 import "../interfaces/IKinetiqIntegration.sol";
 import "../interfaces/IStabilityPool.sol";
 import "../interfaces/IDexIntegration.sol";
@@ -15,12 +16,20 @@ import "../core/HypeZionExchange.sol";
 /**
  * @title KinetiqYieldManager
  * @notice Manages yield harvesting and compounding from kHYPE staking following Hylo's economic model
+ * @notice Manages yield harvesting and compounding from kHYPE staking following Hylo's economic model
  * @dev Harvests kHYPE yield and compounds to StabilityPool as hzUSD
  *      - Staked hzUSD holders receive 100% of yield
  *      - xHYPE holders receive 0% yield (pure leverage exposure)
  *      - Harvest/compound functions are restricted to OPERATOR_ROLE
+ *      - Harvest/compound functions are restricted to OPERATOR_ROLE
  *      - All validation logic is in the contract
  *      - UUPS upgradeable pattern
+ *
+ * V2 Changes (DEX-based flow):
+ *      - Removed 2-step queue/claim flow (old Kinetiq unstaking)
+ *      - New single-step harvestAndCompound() using DEX swaps
+ *      - No waiting period (instant DEX swaps)
+ *      - Lower minimum harvest amount (0.01 HYPE vs 5 HYPE)
  *
  * V2 Changes (DEX-based flow):
  *      - Removed 2-step queue/claim flow (old Kinetiq unstaking)
@@ -31,8 +40,11 @@ import "../core/HypeZionExchange.sol";
 contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgradeable, UUPSUpgradeable {
     using SafeERC20 for IERC20;
 
+    using SafeERC20 for IERC20;
+
     bytes32 public constant OPERATOR_ROLE = keccak256("OPERATOR_ROLE");
 
+    // Kinetiq integration contract (for exchange rate queries)
     // Kinetiq integration contract (for exchange rate queries)
     IKinetiqIntegration public kinetiqIntegration;
 
@@ -41,13 +53,22 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
     address public stabilityPool;
 
     // @deprecated - kept for storage layout compatibility
+    // @deprecated - kept for storage layout compatibility
     struct WithdrawalRequest {
         uint256 withdrawalId;
         uint256 kHypeAmount;
         uint256 hypeAmount;
         uint256 queuedAt;
         bool claimed;
+        uint256 withdrawalId;
+        uint256 kHypeAmount;
+        uint256 hypeAmount;
+        uint256 queuedAt;
+        bool claimed;
     }
+    WithdrawalRequest[] internal pendingWithdrawals; // @deprecated
+    mapping(uint256 => uint256) internal withdrawalIdToIndex; // @deprecated
+
     WithdrawalRequest[] internal pendingWithdrawals; // @deprecated
     mapping(uint256 => uint256) internal withdrawalIdToIndex; // @deprecated
 
@@ -60,13 +81,17 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
         uint256 yieldAccrued;
     }
 
+
     // Historical NAV snapshots
     NAVSnapshot[] public navHistory;
     mapping(uint256 => NAVSnapshot) public navSnapshots; // timestamp => snapshot
 
+
     // Yield distribution
     uint256 public totalYieldHarvested;
     uint256 public lastHarvestTimestamp;
+    uint256 public lastCompoundTimestamp;
+    uint256 public harvestInterval; // @deprecated - kept for storage layout compatibility
     uint256 public lastCompoundTimestamp;
     uint256 public harvestInterval; // @deprecated - kept for storage layout compatibility
 
@@ -115,6 +140,9 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
     error SwapFailed();
     error MintFailed();
     error NoPendingHype();
+    error SwapFailed();
+    error MintFailed();
+    error NoPendingHype();
 
     /// @custom:oz-upgrades-unsafe-allow constructor
     constructor() {
@@ -138,6 +166,7 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
         // Set default values
         navAlertThreshold = 95e16; // 0.95 - alert if NAV drops below 95% of expected
         minHarvestAmount = 0.01 ether;
+        minHarvestAmount = 0.01 ether;
 
         _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
         _grantRole(OPERATOR_ROLE, msg.sender);
@@ -149,8 +178,17 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
      *      so there's no security risk from receiving HYPE from unknown sources.
      */
     receive() external payable {}
+     * @notice Receive HYPE from DEX swaps and other sources
+     * @dev Accept HYPE from any source. This contract doesn't hold user funds,
+     *      so there's no security risk from receiving HYPE from unknown sources.
+     */
+    receive() external payable {}
 
     /**
+     * @notice Helper: Calculate total HYPE value of collateral kHYPE (excludes protocol fees)
+     * @dev Uses totalKHYPEBalance (accounting balance) instead of physical vault balance
+     *      to exclude accumulatedFees kHYPE from yield calculations.
+     * @return Total HYPE value (collateral kHYPE × exchange rate)
      * @notice Helper: Calculate total HYPE value of collateral kHYPE (excludes protocol fees)
      * @dev Uses totalKHYPEBalance (accounting balance) instead of physical vault balance
      *      to exclude accumulatedFees kHYPE from yield calculations.
@@ -158,15 +196,20 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
      */
     function _getTotalHYPEValue() internal view returns (uint256) {
         uint256 collateralKHYPE = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
+        uint256 collateralKHYPE = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
         uint256 exchangeRate = kinetiqIntegration.getExchangeRate();
+        return (collateralKHYPE * exchangeRate) / 1e18;
         return (collateralKHYPE * exchangeRate) / 1e18;
     }
 
     /**
      * @notice Update NAV snapshot from vault
+     * @notice Update NAV snapshot from vault
      * @dev Fetches current exchange rate and balances from vault
      */
     function updateNAV() external onlyRole(OPERATOR_ROLE) {
+        // Use accounting balance (excludes fee kHYPE) for accurate NAV tracking
+        uint256 khypeBalance = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
         // Use accounting balance (excludes fee kHYPE) for accurate NAV tracking
         uint256 khypeBalance = HypeZionExchange(hypeZionExchange).totalKHYPEBalance();
         uint256 exchangeRate = kinetiqIntegration.getExchangeRate();
@@ -175,9 +218,11 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
 
         uint256 hypeValue = (khypeBalance * exchangeRate) / 1e18;
 
+
         if (exchangeRate < MIN_NAV_RATIO * navAlertThreshold / 1e18) {
             emit NAVAlert(block.timestamp, exchangeRate, MIN_NAV_RATIO);
         }
+
 
         uint256 yieldAccrued = 0;
         if (navHistory.length > 0) {
@@ -187,6 +232,7 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
             }
         }
 
+
         NAVSnapshot memory snapshot = NAVSnapshot({
             khypeBalance: khypeBalance,
             hypeValue: hypeValue,
@@ -195,13 +241,17 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
             yieldAccrued: yieldAccrued
         });
 
+
         navHistory.push(snapshot);
         navSnapshots[block.timestamp] = snapshot;
+
 
         emit NAVUpdated(block.timestamp, khypeBalance, hypeValue, exchangeRate);
     }
 
+
     /**
+     * @notice Calculate current yield available for harvesting in HYPE terms
      * @notice Calculate current yield available for harvesting in HYPE terms
      * @dev Yield = Current HYPE value - Original deposits (from Exchange)
      * @return yieldInHYPE Amount of HYPE yield available
@@ -221,7 +271,11 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
      * @notice Calculate current yield available for harvesting in kHYPE terms
      * @dev Converts HYPE yield to kHYPE using exchange rate
      * @return yieldInKHYPE Amount of kHYPE yield available
+     * @notice Calculate current yield available for harvesting in kHYPE terms
+     * @dev Converts HYPE yield to kHYPE using exchange rate
+     * @return yieldInKHYPE Amount of kHYPE yield available
      */
+    function calculateYieldInKHYPE() public view returns (uint256 yieldInKHYPE) {
     function calculateYieldInKHYPE() public view returns (uint256 yieldInKHYPE) {
         uint256 yieldInHYPE = calculateYield();
         if (yieldInHYPE == 0) return 0;
@@ -251,14 +305,21 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
 
         // 3. Safety check: ensure remaining covers 100% redemption
         uint256 currentValue = _getTotalHYPEValue();
+        // 3. Safety check: ensure remaining covers 100% redemption
+        uint256 currentValue = _getTotalHYPEValue();
         uint256 totalUserDeposits = HypeZionExchange(hypeZionExchange).totalHYPECollateral();
+        uint256 yieldInHYPE = calculateYield();
         uint256 yieldInHYPE = calculateYield();
         uint256 remainingValue = currentValue - yieldInHYPE;
         if (remainingValue < totalUserDeposits) revert InsufficientRemaining();
 
         // 4. Withdraw kHYPE from vault via Exchange (transfers kHYPE to this contract)
         HypeZionExchange(hypeZionExchange).withdrawKHYPEForYield(yieldInKHYPE);
+        // 4. Withdraw kHYPE from vault via Exchange (transfers kHYPE to this contract)
+        HypeZionExchange(hypeZionExchange).withdrawKHYPEForYield(yieldInKHYPE);
 
+        // 5. Get kHYPE token address
+        address kHypeToken = kinetiqIntegration.getKHypeAddress();
         // 5. Get kHYPE token address
         address kHypeToken = kinetiqIntegration.getKHypeAddress();
 
@@ -283,7 +344,11 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
 
         // 8. Update harvest tracking
         lastHarvestTimestamp = block.timestamp;
+        // 8. Update harvest tracking
+        lastHarvestTimestamp = block.timestamp;
 
+        emit YieldHarvestedToStorage(yieldInKHYPE, hypeReceived, block.timestamp);
+        return hypeReceived;
         emit YieldHarvestedToStorage(yieldInKHYPE, hypeReceived, block.timestamp);
         return hypeReceived;
     }
@@ -306,10 +371,14 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
 
         // 2. Clear pending amount before external calls (CEI pattern)
         pendingHarvestedHype = 0;
+        // 2. Clear pending amount before external calls (CEI pattern)
+        pendingHarvestedHype = 0;
 
         // 3. Mint hzUSD from HYPE (includes HYPE → kHYPE swap inside mintStablecoin)
         require(hypeZionExchange != address(0), "Exchange not set");
         HypeZionExchange exchange = HypeZionExchange(payable(hypeZionExchange));
+        hzusdMinted = exchange.mintStablecoin{value: hypeAmount}(hypeAmount, hypeToKHypeSwapData);
+        if (hzusdMinted == 0) revert MintFailed();
         hzusdMinted = exchange.mintStablecoin{value: hypeAmount}(hypeAmount, hypeToKHypeSwapData);
         if (hzusdMinted == 0) revert MintFailed();
 
@@ -330,7 +399,14 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
 
         emit YieldCompounded(0, hypeAmount, hzusdMinted, block.timestamp);
         return hzusdMinted;
+        // 6. Update tracking
+        totalYieldHarvested += hypeAmount;
+        lastCompoundTimestamp = block.timestamp;
+
+        emit YieldCompounded(0, hypeAmount, hzusdMinted, block.timestamp);
+        return hzusdMinted;
     }
+
 
     /**
      * @notice Set NAV alert threshold
@@ -339,17 +415,25 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
     function setNAVAlertThreshold(uint256 newThreshold) external onlyRole(DEFAULT_ADMIN_ROLE) {
         if (newThreshold == 0 || newThreshold > 1e18) revert InvalidThreshold();
 
+
         uint256 oldThreshold = navAlertThreshold;
         navAlertThreshold = newThreshold;
+
 
         emit NAVAlertThresholdUpdated(oldThreshold, newThreshold);
     }
 
+
     /**
+     * @notice Check if harvest is available and worthwhile
      * @notice Check if harvest is available and worthwhile
      * @return canHarvestNow Whether harvest can be performed
      * @return yieldAmount Current yield available in kHYPE
+     * @return yieldAmount Current yield available in kHYPE
      */
+    function canHarvest() external view returns (bool canHarvestNow, uint256 yieldAmount) {
+        yieldAmount = calculateYieldInKHYPE();
+        canHarvestNow = yieldAmount >= minHarvestAmount;
     function canHarvest() external view returns (bool canHarvestNow, uint256 yieldAmount) {
         yieldAmount = calculateYieldInKHYPE();
         canHarvestNow = yieldAmount >= minHarvestAmount;
@@ -436,3 +520,4 @@ contract KinetiqYieldManager is AccessControlUpgradeable, ReentrancyGuardUpgrade
      */
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {}
 }
+

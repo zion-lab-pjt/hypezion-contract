@@ -108,7 +108,6 @@ contract HypeZionExchange is
 
     // ========================
     // === WITHDRAWALS ========
-    // ========================
     HypeZionWithdrawalManagerLibrary.WithdrawalStorage private withdrawals;
 
     // DEPRECATED, use _bullHYPEFees and _hzUSDFees
@@ -183,12 +182,18 @@ contract HypeZionExchange is
         // (scripts/deploy/09-setup-configuration.js)
 
         // Initialize withdrawal manager (must be here — sets nextWithdrawalId=1)
+        // Note: minimumAmounts, maxTotalDeposit, maxRateDivergenceBps,
+        // _bullHYPEFees, _hzUSDFees are configured via setup script
+        // (scripts/deploy/09-setup-configuration.js)
+
+        // Initialize withdrawal manager (must be here — sets nextWithdrawalId=1)
         withdrawals.initialize(MOCK_WITHDRAWAL_DELAY);
     }
 
     // =====================
     // ====== NAV計算 ======
     // =====================
+
 
     /**
      * @notice Calculate zUSD NAV in HYPE (zUSD = $1 fixed)
@@ -198,11 +203,13 @@ contract HypeZionExchange is
         IOracle.PriceData memory hypePrice = oracle.getPrice("HYPE");
         if (hypePrice.price == 0) revert OraclePriceInvalid();
 
+
         // zUSD is $1, so NAV = 1 / HYPE_USD_price
         // nav = (1 USD) / (USD per HYPE) = HYPE
         // Scale to 1e18: nav = 1e18 / hypePrice.price
         nav = (PRECISION * PRECISION) / hypePrice.price;
     }
+
 
     /**
      * @notice Calculate total reserves in HYPE (includes locked kHYPE for pending redemptions)
@@ -238,6 +245,7 @@ contract HypeZionExchange is
                 ? (totalKHYPEBalance * kHypeExchangeRate) / PRECISION
                 : 0;
     }
+
 
     /**
      * @notice Calculate available reserves in HYPE (excludes locked kHYPE)
@@ -293,8 +301,10 @@ contract HypeZionExchange is
         if (zusdSupply == 0) return 0;
 
         uint256 zusdNav = (PRECISION * PRECISION) / hypePrice;
+        uint256 zusdNav = (PRECISION * PRECISION) / hypePrice;
         return (zusdSupply * zusdNav) / PRECISION;
     }
+
 
     /**
      * @notice Calculate zHYPE NAV in HYPE using Hylo's invariant
@@ -369,6 +379,7 @@ contract HypeZionExchange is
         return (totalReserve * BASIS_POINTS) / zusdLiabilities;
     }
 
+
     /**
      * @notice Calculate system CR using provided HYPE price
      * @param hypePrice HYPE price from oracle
@@ -429,14 +440,24 @@ contract HypeZionExchange is
             if (cr >= NORMAL_CR_THRESHOLD) return fees.redeemHealthy;
             if (cr >= CAUTIOUS_CR_THRESHOLD) return fees.redeemCautious;
             return fees.redeemCritical;
+            if (cr >= NORMAL_CR_THRESHOLD) return fees.redeemHealthy;
+            if (cr >= CAUTIOUS_CR_THRESHOLD) return fees.redeemCautious;
+            return fees.redeemCritical;
         }
     }
+
 
     // =====================
     // ====== MINTING ======
     // =====================
 
+
     /**
+     * @notice Mint zHYPE leveraged tokens by staking or swapping HYPE to kHYPE
+     * @dev If swapData is empty, uses Kinetiq staking (no slippage, min 5 HYPE, dynamic fee)
+     *      If swapData is provided, uses DEX swap (flexible, slippage protected, fixed fee)
+     * @param amountHYPE Amount of HYPE to convert
+     * @param swapData Encoded swap data from KyberSwap API (empty for Kinetiq staking)
      * @notice Mint zHYPE leveraged tokens by staking or swapping HYPE to kHYPE
      * @dev If swapData is empty, uses Kinetiq staking (no slippage, min 5 HYPE, dynamic fee)
      *      If swapData is provided, uses DEX swap (flexible, slippage protected, fixed fee)
@@ -553,14 +574,18 @@ contract HypeZionExchange is
         updateSystemState();
     }
 
+
     // =====================
     // === SYSTEM MGMT =====
     // =====================
 
+
     /**
      * @notice Update system state based on current CR
      * @dev Public function - callable by anyone to refresh state
+     * @dev Public function - callable by anyone to refresh state
      */
+    function updateSystemState() public {
     function updateSystemState() public {
         uint256 cr = getSystemCR();
         IHypeZionExchange.SystemState newState;
@@ -868,6 +893,8 @@ contract HypeZionExchange is
         lockedKHYPEBalance -= request.khypeAmount;
 
         // Fee was already collected as kHYPE at redeem time — no withholding needed
+
+        // Fee was already collected as kHYPE at redeem time — no withholding needed
         // Tokens were already burned at queue time in _executeRedeem — no burn needed here.
 
         // Transfer total HYPE (primary + secondary) to user
@@ -877,6 +904,8 @@ contract HypeZionExchange is
         // Update user position and totals
         userPositions[msg.sender].lastUpdateTime = block.timestamp;
 
+        // Note: totalHYPECollateral and totalHypeDeposited were already reduced
+        // at queue time in _executeRedeem (when kHYPE left the vault).
         // Note: totalHYPECollateral and totalHypeDeposited were already reduced
         // at queue time in _executeRedeem (when kHYPE left the vault).
 
@@ -896,6 +925,7 @@ contract HypeZionExchange is
         );
 
         // Update system state
+        updateSystemState();
         updateSystemState();
 
         return hypeReceived;
@@ -1238,7 +1268,10 @@ contract HypeZionExchange is
     // === ADMIN FUNCTIONS =
     // =====================
 
+
     /**
+     * @notice Collect accumulated fees and send to specified recipient
+     * @param recipient Address to receive the collected kHYPE fees
      * @notice Collect accumulated fees and send to specified recipient
      * @param recipient Address to receive the collected kHYPE fees
      */
@@ -1248,6 +1281,7 @@ contract HypeZionExchange is
         if (recipient == address(0)) revert InvalidAddress();
         uint256 fees = accumulatedFees;
         if (fees == 0) revert AmountMustBeGreaterThanZero();
+        if (fees == 0) revert AmountMustBeGreaterThanZero();
         accumulatedFees = 0;
 
         // Withdraw fee kHYPE from vault and send to recipient
@@ -1255,6 +1289,7 @@ contract HypeZionExchange is
         address khypeToken = kHypeToken;
         IERC20(khypeToken).safeTransfer(recipient, fees);
 
+        emit FeesCollected(recipient, fees);
         emit FeesCollected(recipient, fees);
     }
 
@@ -1279,6 +1314,7 @@ contract HypeZionExchange is
     function pause() external onlyRole(DEFAULT_ADMIN_ROLE) {
         _pause();
     }
+
 
     /**
      * @notice Unpause protocol (owner only)
@@ -1586,3 +1622,4 @@ contract HypeZionExchange is
         return _hzUSDFees;
     }
 }
+

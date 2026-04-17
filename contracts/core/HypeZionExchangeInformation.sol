@@ -33,8 +33,21 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
     uint256 public constant PRECISION = 1e18;
     uint256 public constant BASIS_POINTS = 10000;
     uint256 public constant SECONDS_PER_YEAR = 365 days;
+    uint256 public constant SECONDS_PER_YEAR = 365 days;
 
     IHypeZionExchange public exchange;
+
+    // Rolling window snapshot system for APY calculation
+    // Store weekly exchange rate snapshots to calculate 14-day rolling APY
+    mapping(uint256 => uint256) public rateSnapshots; // week number => exchange rate
+    uint256 public latestSnapshotWeek;
+    uint256 public snapshotCount; // Number of snapshots taken (for warm-up period detection)
+    uint256 public initialSnapshotWeek; // Week number when first snapshot was created (for upgrade safety)
+    uint256 public constant SNAPSHOT_INTERVAL = 7 days; // Save rate every week
+    uint256 public constant APY_WINDOW = 14 days; // Calculate APY from 2-week window
+
+    // Warm-up APY estimate (2% = 200 basis points) - conservative estimate for Kinetiq yield
+    uint256 public constant WARMUP_APY_ESTIMATE = 200;
 
     // Rolling window snapshot system for APY calculation
     // Store weekly exchange rate snapshots to calculate 14-day rolling APY
@@ -56,6 +69,7 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         uint256 zusdNavInHYPE;        // zUSD NAV in HYPE terms
         uint256 zhypeNavInHYPE;       // zHYPE NAV in HYPE terms
         uint256 szusdNavInHYPE;       // szUSD NAV in HYPE terms (share price converted)
+        uint256 szusdNavInHYPE;       // szUSD NAV in HYPE terms (share price converted)
 
         // Reserve and liability information (18 decimals)
         uint256 totalReserveInHYPE;   // Total protocol reserves in HYPE
@@ -74,6 +88,7 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         // Protocol balances (18 decimals)
         uint256 totalHYPECollateral;  // Total HYPE staked in protocol
         uint256 totalKHYPEBalance;    // Total kHYPE held by protocol
+        uint256 accumulatedProtocolFees; // Fees accumulated by protocol (in kHYPE units, convert via exchangeRate for HYPE value)
         uint256 accumulatedProtocolFees; // Fees accumulated by protocol (in kHYPE units, convert via exchangeRate for HYPE value)
 
         // Kinetiq integration (18 decimals)
@@ -142,6 +157,34 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
                 latestSnapshotWeek - snapshotCount + 1 :
                 0;
         }
+
+        // Initialize rolling window snapshot system
+        IKinetiqIntegration kinetiq = IKinetiqIntegration(exchange.kinetiq());
+        uint256 currentRate = kinetiq.getExchangeRate();
+
+        // Create initial snapshot
+        uint256 currentWeek = block.timestamp / SNAPSHOT_INTERVAL;
+        rateSnapshots[currentWeek] = currentRate;
+        initialSnapshotWeek = currentWeek;
+        latestSnapshotWeek = currentWeek;
+        snapshotCount = 1; // First snapshot created during initialization
+    }
+
+    /**
+     * @notice Reinitialize for upgrades - sets initialSnapshotWeek if not already set
+     * @dev Call this after upgrading from a version without initialSnapshotWeek
+     *      Safe to call multiple times - only sets if currently 0
+     */
+    function reinitializeSnapshotTracking() external onlyRole(DEFAULT_ADMIN_ROLE) {
+        // Only set if not already initialized (for upgrades from older versions)
+        if (initialSnapshotWeek == 0 && snapshotCount > 0) {
+            // For existing deployments, use latestSnapshotWeek - snapshotCount + 1 as approximation
+            // This assumes snapshots were taken somewhat regularly
+            // If not, the warm-up period will just be slightly longer (safe behavior)
+            initialSnapshotWeek = latestSnapshotWeek >= snapshotCount ?
+                latestSnapshotWeek - snapshotCount + 1 :
+                0;
+        }
     }
 
     /**
@@ -161,6 +204,7 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         zusdNav = PRECISION; // 1e18 = $1.00
 
         // Get HYPE price first
+        // Get HYPE price first
         IOracle oracle = IOracle(exchange.oracle());
         IOracle.PriceData memory hypePriceData = oracle.getPrice("HYPE");
         hypePrice = hypePriceData.price; // HYPE price in USD
@@ -173,6 +217,20 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
             zhypeNav = 0;
         }
 
+        // zHYPE NAV in USD - may fail in emergency state (CR < 100%)
+        try exchange.getZhypeNavInHYPE() returns (uint256 zhypeNavInHYPE) {
+            zhypeNav = (zhypeNavInHYPE * hypePrice) / PRECISION;
+        } catch {
+            // In emergency state, zHYPE NAV is 0
+            zhypeNav = 0;
+        }
+
+        // szUSD NAV (share price) - may fail in emergency state
+        try exchange.getSzUSDNavInUSD() returns (uint256 nav) {
+            szusdNav = nav;
+        } catch {
+            szusdNav = 0;
+        }
         // szUSD NAV (share price) - may fail in emergency state
         try exchange.getSzUSDNavInUSD() returns (uint256 nav) {
             szusdNav = nav;
@@ -193,6 +251,13 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         } catch {
             zusdNav = PRECISION; // Default to 1:1 in emergency
         }
+        // Calculate all NAVs and metrics with try-catch for emergency state resilience
+        uint256 zusdNav = 0;
+        try exchange.getZusdNavInHYPE() returns (uint256 nav) {
+            zusdNav = nav;
+        } catch {
+            zusdNav = PRECISION; // Default to 1:1 in emergency
+        }
 
         // Try to get zHYPE NAV, return 0 if in critical state
         uint256 zhypeNav = 0;
@@ -203,6 +268,54 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
             zhypeNav = 0;
         }
 
+        // Calculate szUSD NAV in HYPE terms
+        // szUSD NAV (share price) is in USD, convert to HYPE using oracle price
+        uint256 szusdNav = 0;
+        try exchange.getSzUSDNavInUSD() returns (uint256 navInUsd) {
+            // Get HYPE price from oracle
+            IOracle oracle = IOracle(exchange.oracle());
+            try oracle.getPrice("HYPE") returns (IOracle.PriceData memory hypePriceData) {
+                if (hypePriceData.price > 0) {
+                    // Convert USD to HYPE: navInUsd / hypePrice
+                    // szusdNavInHYPE = navInUsd * PRECISION / hypePrice
+                    szusdNav = (navInUsd * PRECISION) / hypePriceData.price;
+                }
+            } catch {
+                szusdNav = 0;
+            }
+        } catch {
+            szusdNav = 0;
+        }
+
+        // Try to get reserves - may fail if Kinetiq has issues
+        uint256 totalReserve = 0;
+        try exchange.getTotalReserveInHYPE() returns (uint256 reserve) {
+            totalReserve = reserve;
+        } catch {
+            // Fallback: use raw collateral values
+            totalReserve = exchange.totalHYPECollateral();
+        }
+
+        // Try to get liabilities
+        uint256 zusdLiabilities = 0;
+        try exchange.getZusdLiabilitiesInHYPE() returns (uint256 liabilities) {
+            zusdLiabilities = liabilities;
+        } catch {
+            zusdLiabilities = 0;
+        }
+
+        // Try to get system CR
+        uint256 systemCR = 0;
+        try exchange.getSystemCR() returns (uint256 cr) {
+            systemCR = cr;
+        } catch {
+            // In emergency, calculate from available data
+            if (zusdLiabilities > 0) {
+                systemCR = (totalReserve * BASIS_POINTS) / zusdLiabilities;
+            }
+        }
+
+        uint256 currentFee = exchange.getProtocolFee(true, true);  // hzUSD mint fee as default
         // Calculate szUSD NAV in HYPE terms
         // szUSD NAV (share price) is in USD, convert to HYPE using oracle price
         uint256 szusdNav = 0;
@@ -280,6 +393,13 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         } catch {
             stabilityPoolAPY = 0;
         }
+        // Calculate stability pool APY - may fail in emergency state
+        uint256 stabilityPoolAPY = 0;
+        try this.calculateStabilityPoolAPYSafe(stabilityPool, kinetiqExchangeRate, zusdSupply) returns (uint256 apy) {
+            stabilityPoolAPY = apy;
+        } catch {
+            stabilityPoolAPY = 0;
+        }
 
         return ProtocolInformation({
             // Protocol version
@@ -288,6 +408,7 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
             // NAV information
             zusdNavInHYPE: zusdNav,
             zhypeNavInHYPE: zhypeNav,
+            szusdNavInHYPE: szusdNav,
             szusdNavInHYPE: szusdNav,
 
             // Reserve and liability information
@@ -347,6 +468,9 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
 
         return leverage;
     }
+
+    // Event for rate snapshot updates
+    event RateSnapshotUpdated(uint256 indexed week, uint256 rate, uint256 timestamp);
 
     /**
      * @notice Compute the combined reserve-to-collateral rate for all yield sources
@@ -474,12 +598,35 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
      *      Returns 0 only if:
      *      - No funds are staked
      *      - Exchange rate decreased (negative yield)
+     * @dev Implements 14-day rolling window APY calculation to match Kinetiq's methodology:
+     *      APY = Rolling_Window_Yield × Concentration_Multiplier
+     *
+     *      IMPORTANT: Concentration is based on TOTAL protocol HYPE, not just hzUSD backing.
+     *      All protocol HYPE (backing both hzUSD and BullHYPE) generates yield for szUSD holders.
+     *
+     *      Concentration_Multiplier = Total_Protocol_HYPE / Staked_Amount_In_HYPE
+     *      Where:
+     *        - Total_Protocol_HYPE = getTotalReserveInHYPE() (hzUSD + BullHYPE backing)
+     *        - Staked_Amount_In_HYPE = szUSD_staked × (zusdLiabilities / zusdSupply)
+     *
+     *      Rolling_Window_Yield = (Current_Rate - Rate_2_Weeks_Ago) / Rate_2_Weeks_Ago
+     *      Annualized_APY = Rolling_Window_Yield × (365_days / 14_days)
+     *
+     *      Warm-up behavior:
+     *      - Uses conservative 2% estimate when not enough snapshot history
+     *      - Falls back to warm-up estimate if snapshots are missing (non-consecutive weeks)
+     *
+     *      Returns 0 only if:
+     *      - No funds are staked
+     *      - Exchange rate decreased (negative yield)
      */
     function _calculateStabilityPoolAPY(
         IStabilityPool stabilityPool,
         uint256 kinetiqExchangeRate,
         uint256 zusdSupply
     ) internal view returns (uint256 apy) {
+        // Early return if no supply
+        if (zusdSupply == 0) {
         // Early return if no supply
         if (zusdSupply == 0) {
             return 0;
@@ -489,10 +636,13 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
         uint256 stakedAmount = stabilityPool.totalAssets();
 
         // No APY if nothing is staked
+        // No APY if nothing is staked
         if (stakedAmount == 0) {
             return 0;
         }
 
+        // Step 1: Calculate base Kinetiq APY (before concentration multiplier)
+        uint256 baseKinetiqAPY = _calculateBaseKinetiqAPY(kinetiqExchangeRate);
         // Step 1: Calculate base Kinetiq APY (before concentration multiplier)
         uint256 baseKinetiqAPY = _calculateBaseKinetiqAPY(kinetiqExchangeRate);
 
@@ -503,7 +653,15 @@ contract HypeZionExchangeInformation is AccessControlUpgradeable, UUPSUpgradeabl
 
         // Step 2: Apply concentration multiplier based on TOTAL protocol HYPE
         apy = _applyConcentrationMultiplier(baseKinetiqAPY, stakedAmount, zusdSupply);
+        // If base APY is 0 (rate decreased), return 0
+        if (baseKinetiqAPY == 0) {
+            return 0;
+        }
 
+        // Step 2: Apply concentration multiplier based on TOTAL protocol HYPE
+        apy = _applyConcentrationMultiplier(baseKinetiqAPY, stakedAmount, zusdSupply);
+
+        // Step 3: Cap APY at 10000 basis points (100%) to prevent unrealistic values
         // Step 3: Cap APY at 10000 basis points (100%) to prevent unrealistic values
         if (apy > 10000) {
             apy = 10000;

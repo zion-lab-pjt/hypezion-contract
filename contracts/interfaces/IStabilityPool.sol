@@ -9,7 +9,7 @@ interface IStabilityPool is IERC4626 {
     event ProtocolIntervention(uint256 zusdConverted, uint256 zhypeReceived);
     event YieldCompounded(uint256 yieldAmount, uint256 newNAV);
     event InterventionStateChanged(bool active);
-    
+
     // Custom errors
     error InterventionActive();
     error InsufficientPoolBalance(uint256 requested, uint256 available);
@@ -18,12 +18,12 @@ interface IStabilityPool is IERC4626 {
     error InsufficientShares(uint256 requested, uint256 available);
     error MustUseMixedWithdrawal();
     error InvalidReceiver();
-    
+
     // Protocol-specific functions
     function protocolIntervention(uint256 amountToConvert, uint256 zhypeReceived) external payable;
     function exitRecoveryMode(uint256 zhypeBurned, uint256 zusdMinted) external;
     function compoundYield(uint256 yieldAmount) external;
-    
+
     // View functions
     function getNAV() external view returns (uint256);
     function getSharePrice() external view returns (uint256);
