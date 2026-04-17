@@ -2,13 +2,15 @@
 pragma solidity ^0.8.22;
 
 import "../../interfaces/IOracleAdapter.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+
 /**
  * @title HyperCoreAdapter
  * @notice Adapter for HyperCore Precompile integration
  * @dev Provides access to native HyperEVM price data from L1 trading engine
  *      Based on QuickNode documentation - uses correct token indexes
  */
-contract HyperCoreAdapter is IOracleAdapter {
+contract HyperCoreAdapter is IOracleAdapter, Ownable {
 
     // HyperCore precompile addresses
     address constant ORACLE_PX_PRECOMPILE_ADDRESS = 0x0000000000000000000000000000000000000807;
@@ -32,17 +34,19 @@ contract HyperCoreAdapter is IOracleAdapter {
     error TokenNotConfigured(string symbol);
     error InvalidTokenConfig(uint32 index, uint8 szDecimals);
 
-    constructor() {
+    constructor() Ownable(msg.sender) {
         // Default initialization - will be configured via initializeForNetwork()
     }
 
     /**
      * @notice Configure a token with index and decimals
-     * @param symbol Token symbol (e.g., "HYPE", "BTC")
-     * @param index Token index in oracle precompile
-     * @param szDecimals Number of significant digits for price conversion
+    * @param symbol Token symbol (e.g., "HYPE", "BTC")
+    * @param index Token index in oracle precompile
+    * @param szDecimals Number of significant digits for price conversion
      */
-    function configureToken(string memory symbol, uint32 index, uint8 szDecimals) external {
+    function configureToken(string memory symbol, uint32 index, uint8 szDecimals) external onlyOwner {
+        require(szDecimals <= 6, "szDecimals too large");
+
         tokenConfigs[symbol] = TokenConfig({
             index: index,
             szDecimals: szDecimals,
@@ -62,10 +66,12 @@ contract HyperCoreAdapter is IOracleAdapter {
         string[] memory symbols,
         uint32[] memory indexes,
         uint8[] memory szDecimalsArray
-    ) external {
+    ) external onlyOwner {
         require(symbols.length == indexes.length && indexes.length == szDecimalsArray.length, "Array length mismatch");
 
         for (uint i = 0; i < symbols.length; i++) {
+            require(szDecimalsArray[i] <= 6, "szDecimals too large");
+
             tokenConfigs[symbols[i]] = TokenConfig({
                 index: indexes[i],
                 szDecimals: szDecimalsArray[i],
@@ -78,6 +84,9 @@ contract HyperCoreAdapter is IOracleAdapter {
     
     /**
      * @notice Get price data from HyperCore following QuickNode documentation pattern
+     * @dev HyperCore's precompile response does not include a timestamp, so this adapter
+     *      uses block.timestamp as the reported timestamp. OracleAggregator maxStaleness
+     *      should therefore be configured aggressively for HyperCore sources (for example, 60 seconds).
      * @param symbol Token symbol (e.g., "BTC", "ETH", "HYPE")
      * @return priceData Price data in HypeNova format
      */

@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.22;
 
-import "../interfaces/IKinetiqIntegration.sol";
 
 /**
  * @title HypeZionWithdrawalManagerLibrary
@@ -90,7 +89,7 @@ library HypeZionWithdrawalManagerLibrary {
     function initialize(
         WithdrawalStorage storage self,
         uint256 _withdrawalDelay
-    ) internal {
+    ) public {
         self.nextWithdrawalId = 1;
         // minWithdrawalAmount removed - validation handled at protocol level
         self.maxPendingWithdrawals = 10;
@@ -103,10 +102,10 @@ library HypeZionWithdrawalManagerLibrary {
      * @param requester Address of the requester
      * @param tokenAmount Amount of zUSD/zHYPE to burn (when claimed)
      * @param khypeAmount Amount of kHYPE to withdraw
-     * @param expectedHype Expected HYPE amount to receive
+     * @param expectedHype Expected HYPE amount to receive (net, after fee)
      * @param kinetiqWithdrawalId Withdrawal ID from Kinetiq
      * @param isZusd Whether this is a zUSD redemption (vs zHYPE)
-     * @param kinetiq Kinetiq integration contract
+     * @param withdrawalDelay Kinetiq withdrawal delay in seconds (for FE display)
      * @return requestId Withdrawal request ID
      */
     function queueWithdrawal(
@@ -117,16 +116,13 @@ library HypeZionWithdrawalManagerLibrary {
         uint256 expectedHype,
         uint256 kinetiqWithdrawalId,
         bool isZusd,
-        IKinetiqIntegration kinetiq
-    ) internal returns (uint256 requestId) {
+        uint256 withdrawalDelay
+    ) public returns (uint256 requestId) {
         // Check pending withdrawals limit
         uint256 pendingCount = countPendingWithdrawals(self, requester);
         if (pendingCount >= self.maxPendingWithdrawals) {
             revert TooManyPendingWithdrawals(requester, pendingCount, self.maxPendingWithdrawals);
         }
-
-        // Get withdrawal delay from Kinetiq for FE display
-        uint256 withdrawalDelay = kinetiq.getWithdrawalDelay();
 
         // Create withdrawal request
         requestId = self.nextWithdrawalId++;
@@ -162,15 +158,15 @@ library HypeZionWithdrawalManagerLibrary {
     }
 
     /**
-     * @notice Check and update withdrawal status by querying Kinetiq
+     * @notice Check and update withdrawal status
      * @param self Storage pointer
      * @param requestId Withdrawal request ID
-     * @param kinetiq Kinetiq integration contract
+     * @param isPrimaryReady Whether the primary (Kinetiq) withdrawal is ready
      */
     function checkWithdrawalStatus(
         WithdrawalStorage storage self,
         uint256 requestId,
-        IKinetiqIntegration kinetiq
+        bool isPrimaryReady
     ) internal {
         WithdrawalRequest storage request = self.requests[requestId];
 
@@ -180,9 +176,7 @@ library HypeZionWithdrawalManagerLibrary {
 
         if (request.state != WithdrawalState.Queued) return;
 
-        // Check if withdrawal is ready in Kinetiq
-        (bool ready, ) = kinetiq.isUnstakeReady(request.kinetiqWithdrawalId);
-        if (ready) {
+        if (isPrimaryReady) {
             request.state = WithdrawalState.Ready;
             self.totalQueued--;
             self.totalReady++;
@@ -192,42 +186,30 @@ library HypeZionWithdrawalManagerLibrary {
     }
 
     /**
-     * @notice Prepare withdrawal for claiming (validate and return details)
+     * @notice Prepare withdrawal for claiming (validate ownership and state)
      * @param self Storage pointer
      * @param requestId Withdrawal request ID
      * @param caller Address attempting to claim
-     * @param kinetiq Kinetiq integration contract
+     * @param isPrimaryReady Whether the primary (Kinetiq) withdrawal is ready
      * @return request The withdrawal request details
      */
     function prepareClaimWithdrawal(
         WithdrawalStorage storage self,
         uint256 requestId,
         address caller,
-        IKinetiqIntegration kinetiq
-    ) internal returns (WithdrawalRequest storage request) {
+        bool isPrimaryReady
+    ) public returns (WithdrawalRequest storage request) {
         request = self.requests[requestId];
 
-        // Validations
-        if (request.requester == address(0)) {
-            revert WithdrawalNotFound(requestId);
+        if (request.requester == address(0)) revert WithdrawalNotFound(requestId);
+        if (request.requester != caller) revert UnauthorizedWithdrawal(requestId, caller, request.requester);
+        if (request.state == WithdrawalState.Claimed) revert WithdrawalAlreadyClaimed(requestId);
+
+        if (request.state != WithdrawalState.Ready && !isPrimaryReady) {
+            revert WithdrawalNotReady(requestId, 0);
         }
 
-        if (request.requester != caller) {
-            revert UnauthorizedWithdrawal(requestId, caller, request.requester);
-        }
-
-        if (request.state == WithdrawalState.Claimed) {
-            revert WithdrawalAlreadyClaimed(requestId);
-        }
-
-        // Check if withdrawal is ready in Kinetiq
-        (bool ready, ) = kinetiq.isUnstakeReady(request.kinetiqWithdrawalId);
-        if (request.state != WithdrawalState.Ready && !ready) {
-            revert WithdrawalNotReady(requestId, 0); // timeRemaining not available from Kinetiq
-        }
-
-        // Update state if it wasn't already marked as ready
-        if (request.state == WithdrawalState.Queued && ready) {
+        if (request.state == WithdrawalState.Queued && isPrimaryReady) {
             request.state = WithdrawalState.Ready;
             self.totalQueued--;
             self.totalReady++;
@@ -246,7 +228,7 @@ library HypeZionWithdrawalManagerLibrary {
         WithdrawalStorage storage self,
         uint256 requestId,
         uint256 actualHypeReceived
-    ) internal {
+    ) public {
         WithdrawalRequest storage request = self.requests[requestId];
 
         // Update request
@@ -312,38 +294,31 @@ library HypeZionWithdrawalManagerLibrary {
     function getUserWithdrawals(
         WithdrawalStorage storage self,
         address user
-    ) internal view returns (uint256[] memory) {
+    ) public view returns (uint256[] memory) {
         return self.userWithdrawals[user];
     }
 
     /**
-     * @notice Check if withdrawal is ready to claim by querying Kinetiq
+     * @notice Check if withdrawal is ready to claim
      * @param self Storage pointer
      * @param requestId Request ID
-     * @param kinetiq Kinetiq integration contract
+     * @param isPrimaryReady Whether the primary (Kinetiq) withdrawal is ready
      * @return isReady Whether withdrawal can be claimed
      * @return readyAt Estimated timestamp when withdrawal will be ready (for FE display)
      */
     function isWithdrawalReady(
         WithdrawalStorage storage self,
         uint256 requestId,
-        IKinetiqIntegration kinetiq
-    ) internal view returns (bool isReady, uint256 readyAt) {
+        bool isPrimaryReady
+    ) public view returns (bool isReady, uint256 readyAt) {
         WithdrawalRequest memory request = self.requests[requestId];
 
-        if (request.requester == address(0)) {
-            return (false, 0);
-        }
+        if (request.requester == address(0)) return (false, 0);
 
-        // If already marked as Ready or Claimed, return true
-        if (request.state == WithdrawalState.Ready) {
-            return (true, request.readyAt);
-        }
+        if (request.state == WithdrawalState.Ready) return (true, request.readyAt);
 
-        // If queued, check actual Kinetiq status
         if (request.state == WithdrawalState.Queued) {
-            (bool ready, ) = kinetiq.isUnstakeReady(request.kinetiqWithdrawalId);
-            return (ready, request.readyAt);
+            return (isPrimaryReady, request.readyAt);
         }
 
         return (false, 0);

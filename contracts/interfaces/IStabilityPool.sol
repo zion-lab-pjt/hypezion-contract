@@ -33,6 +33,15 @@ interface IStabilityPool is IERC4626 {
     function hzhypeInPool() external view returns (uint256);
     function revertIntervention() external;
 
+    // Unstake fee functions
+    function getUnstakeFee() external view returns (uint256 feeBps);
+    function unstakeFeeHealthy() external view returns (uint256);
+    function unstakeFeeCautious() external view returns (uint256);
+    function unstakeFeeCritical() external view returns (uint256);
+    function collectUnstakeFees(address recipient) external;
+    function accumulatedUnstakeFees() external view returns (uint256);
+    function accumulatedUnstakeFeesXHYPE() external view returns (uint256);
+
     // Recovery mode support
     function isInRecoveryMode() external view returns (bool);
     function previewMixedRedeem(uint256 shares)
