@@ -5,6 +5,7 @@ node_modules/
 artifacts/
 cache/
 out/
+out-lst/
 
 # Environment variables
 .env

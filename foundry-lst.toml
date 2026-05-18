@@ -1,0 +1,30 @@
+[profile.default]
+src = "contracts/lst"
+out = "out-lst"
+libs = ["node_modules", "lib"]
+test = "test/foundry/fork"
+script = "script"
+
+solc_version = "0.8.22"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 100
+via_ir = true
+
+ffi = true
+
+remappings = [
+    "@openzeppelin/contracts/=node_modules/@openzeppelin/contracts/",
+    "@openzeppelin/contracts-upgradeable/=node_modules/@openzeppelin/contracts-upgradeable/",
+    "forge-std/=lib/forge-std/src/",
+]
+
+# Allow importing from parent contracts directory
+allow_paths = ["contracts"]
+
+[rpc_endpoints]
+hyperliquid = "https://rpc.hyperliquid.xyz/evm"
+hyperliquid_testnet = "https://rpc.hyperliquid-testnet.xyz/evm"
+
+[fuzz]
+runs = 256
